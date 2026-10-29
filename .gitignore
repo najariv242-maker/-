@@ -1,0 +1,11 @@
+# جلوگیری از آپلود فایل‌های حساس، دیتابیس و متغیرهای محیطی در مخزن پابلیک گیت‌هاب
+*.db
+*.db-wal
+*.db-shm
+*.db.enc
+.env
+.env.*
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
