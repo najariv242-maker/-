@@ -16,6 +16,8 @@
 10. عبارات باقاعده پیش‌کامپایل‌شده (`Pre-Compiled Regex`) و جدول ترجمه `str.translate` سطح C
 """
 
+from __future__ import annotations
+
 import asyncio
 import base64
 from collections import OrderedDict, defaultdict
@@ -27,7 +29,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from typing import Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import zlib
 
 # فعال‌سازی موتور فوق‌سریع uvloop در لینوکس در صورت نصب بودن
