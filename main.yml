@@ -65,8 +65,8 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ALLOWED_USER_IDS: ${{ secrets.ALLOWED_USER_IDS }}
           PRIVATE_CHAT_ONLY: "true"
-          TRANSCRIBE_MODEL: "gemini-2.5-flash"
-          CHAT_MODEL: "gemini-2.5-flash"
+          TRANSCRIBE_MODEL: "gemini-3.5-transcribe"
+          CHAT_MODEL: "gemini-3.5-flash-lite"
           DB_PATH: "voice_bot.db"
         run: |
           chmod +x run_workflow.sh
