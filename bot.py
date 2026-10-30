@@ -19,6 +19,7 @@
 import asyncio
 import base64
 from collections import OrderedDict, defaultdict
+import io
 import logging
 import os
 import re
@@ -56,6 +57,7 @@ from humanizer_skill import (
     HUMAN_TELEGRAM_REPLY_SYSTEM_PROMPT,
     SUMMARY_SYSTEM_PROMPT,
     TRANSCRIPTION_CLEANUP_PROMPT,
+    TRANSLATION_SYSTEM_PROMPT,
     strip_ai_punctuation_and_artifacts,
 )
 
@@ -93,13 +95,16 @@ RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 MAX_TELEGRAM_FILE_SIZE_BYTES = 20 * 1024 * 1024
 TELEGRAM_MAX_MSG_LENGTH = 4000
 
-# مدل‌های فوق‌سریع با اولویت کمترین تأخیر (Low-Latency Flash Series)
-TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "gemini-2.5-flash").strip()
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-2.5-flash").strip()
+# مدل‌های نسل جدید هوش مصنوعی گوگل با بالاترین کیفیت و کارایی (Gemini 3.x Series)
+TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "gemini-3.5-transcribe").strip()
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-3.8-flash").strip()
+TTS_MODEL = os.getenv("TTS_MODEL", "gemini-3.8-flash-tts").strip()
+TRANSLATE_MODEL = os.getenv("TRANSLATE_MODEL", "gemini-3.8-flash").strip()
+
 FAST_MODELS = (
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
+    "gemini-3.8-flash",
+    "gemini-3.5-transcribe",
+    "gemini-3.1-pro-preview",
 )
 
 # آستانه حجم فایل برای فشرده‌سازی سریع با ffmpeg در حافظه (۳۵۰ کیلوبایت)
@@ -267,6 +272,7 @@ def init_db() -> None:
             transcript TEXT NOT NULL,
             summary TEXT,
             human_reply TEXT,
+            translation TEXT,
             created_at REAL NOT NULL
         )
         """
@@ -275,6 +281,19 @@ def init_db() -> None:
     existing_cols = {row["name"] for row in cursor.fetchall()}
     if "bot_msg_id" not in existing_cols:
         cursor.execute("ALTER TABLE voice_records ADD COLUMN bot_msg_id INTEGER")
+    if "translation" not in existing_cols:
+        cursor.execute("ALTER TABLE voice_records ADD COLUMN translation TEXT")
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id INTEGER PRIMARY KEY,
+            chat_model TEXT DEFAULT 'gemini-3.8-flash',
+            thinking_level TEXT DEFAULT 'HIGH',
+            transcribe_model TEXT DEFAULT 'gemini-3.5-transcribe'
+        )
+        """
+    )
 
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_chat_voice ON voice_records(chat_id, voice_msg_id)"
@@ -285,6 +304,60 @@ def init_db() -> None:
     conn.commit()
 
 
+# ==================== مدیریت تنظیمات اختصاصی کاربر (User Settings Store) ====================
+_USER_SETTINGS_CACHE: dict[int, dict] = {}
+
+
+def get_user_model_settings(user_id: int) -> dict:
+    if user_id in _USER_SETTINGS_CACHE:
+        return _USER_SETTINGS_CACHE[user_id]
+    conn = _get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT chat_model, thinking_level, transcribe_model FROM user_settings WHERE user_id = ?",
+        (user_id,),
+    )
+    row = cursor.fetchone()
+    if row:
+        settings = dict(row)
+    else:
+        settings = {
+            "chat_model": CHAT_MODEL,
+            "thinking_level": "HIGH",
+            "transcribe_model": TRANSCRIBE_MODEL,
+        }
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO user_settings (user_id, chat_model, thinking_level, transcribe_model)
+            VALUES (?, ?, ?, ?)
+            """,
+            (user_id, settings["chat_model"], settings["thinking_level"], settings["transcribe_model"]),
+        )
+        conn.commit()
+    _USER_SETTINGS_CACHE[user_id] = settings
+    return settings
+
+
+def update_user_setting(user_id: int, key: str, value: str) -> dict:
+    if key not in ("chat_model", "thinking_level", "transcribe_model"):
+        return get_user_model_settings(user_id)
+    settings = get_user_model_settings(user_id)
+    settings[key] = value
+    _USER_SETTINGS_CACHE[user_id] = settings
+    conn = _get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        INSERT INTO user_settings (user_id, {key})
+        VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET {key} = excluded.{key}
+        """,
+        (user_id, value),
+    )
+    conn.commit()
+    return settings
+
+
 def save_record(
     chat_id: int,
     msg_id: int,
@@ -292,16 +365,17 @@ def save_record(
     human_reply: Optional[str] = None,
     bot_msg_id: Optional[int] = None,
     summary: Optional[str] = None,
+    translation: Optional[str] = None,
 ) -> int:
     now = time.time()
     conn = _get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT INTO voice_records (chat_id, voice_msg_id, bot_msg_id, transcript, summary, human_reply, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO voice_records (chat_id, voice_msg_id, bot_msg_id, transcript, summary, human_reply, translation, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (chat_id, msg_id, bot_msg_id, transcript, summary, human_reply, now),
+        (chat_id, msg_id, bot_msg_id, transcript, summary, human_reply, translation, now),
     )
     record_id = int(cursor.lastrowid)
     conn.commit()
@@ -314,6 +388,7 @@ def save_record(
         "transcript": transcript,
         "summary": summary,
         "human_reply": human_reply,
+        "translation": translation,
         "created_at": now,
     }
     _cache_put(record)
@@ -360,7 +435,7 @@ def get_record_by_msg_id(chat_id: int, msg_id: int) -> Optional[dict]:
 
 
 def update_record_field(record_id: int, field: str, value: str | int) -> None:
-    if field not in ("summary", "human_reply", "transcript", "bot_msg_id"):
+    if field not in ("summary", "human_reply", "transcript", "bot_msg_id", "translation"):
         return
     if record_id in _RAM_RECORDS_BY_ID:
         _RAM_RECORDS_BY_ID[record_id][field] = value
@@ -381,18 +456,19 @@ def update_record_field(record_id: int, field: str, value: str | int) -> None:
 def build_voice_action_keyboard(record_id: int, has_reply: bool = False) -> InlineKeyboardMarkup:
     buttons = [
         [
-            InlineKeyboardButton("💬 جواب انسانی (تلگرامی)", callback_data=f"reply:{record_id}"),
+            InlineKeyboardButton("💬 جواب انسانی", callback_data=f"reply:{record_id}"),
             InlineKeyboardButton("📝 خلاصه", callback_data=f"sum:{record_id}"),
-        ]
+        ],
+        [
+            InlineKeyboardButton("🌐 ترجمه", callback_data=f"trans:{record_id}"),
+            InlineKeyboardButton("🔊 ارسال ویس (TTS)", callback_data=f"tts:{record_id}"),
+        ],
     ]
+    sub_row = []
     if has_reply:
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    "🔄 یه مدل دیگه بنویس", callback_data=f"regen:{record_id}"
-                )
-            ]
-        )
+        sub_row.append(InlineKeyboardButton("🔄 مدل دیگر", callback_data=f"regen:{record_id}"))
+    sub_row.append(InlineKeyboardButton("⚙️ تنظیمات مدل", callback_data="open_settings"))
+    buttons.append(sub_row)
     return InlineKeyboardMarkup(buttons)
 
 
@@ -400,11 +476,61 @@ def build_reply_keyboard(record_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🔄 یه مدل دیگه بنویس", callback_data=f"regen:{record_id}"),
+                InlineKeyboardButton("🔄 مدل دیگر", callback_data=f"regen:{record_id}"),
                 InlineKeyboardButton("📝 خلاصه پیام", callback_data=f"sum:{record_id}"),
-            ]
+            ],
+            [
+                InlineKeyboardButton("🌐 ترجمه", callback_data=f"trans:{record_id}"),
+                InlineKeyboardButton("🔊 ارسال ویس (TTS)", callback_data=f"tts:{record_id}"),
+            ],
+            [
+                InlineKeyboardButton("⚙️ تنظیمات مدل", callback_data="open_settings"),
+            ],
         ]
     )
+
+
+def build_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    s = get_user_model_settings(user_id)
+    c_model = s.get("chat_model", "gemini-3.8-flash")
+    t_level = s.get("thinking_level", "HIGH")
+    tr_model = s.get("transcribe_model", "gemini-3.5-transcribe")
+
+    is_flash_high = (c_model == "gemini-3.8-flash" and t_level == "HIGH")
+    is_flash_turbo = (c_model == "gemini-3.8-flash" and t_level == "OFF")
+    is_pro = (c_model == "gemini-3.1-pro-preview")
+    is_trans_35 = (tr_model == "gemini-3.5-transcribe")
+
+    buttons = [
+        [
+            InlineKeyboardButton(
+                f"{'✅ ' if is_flash_high else ''}⚡ Gemini 3.8 Flash (تفکر عمیق High)",
+                callback_data="set_cfg:chat:flash_high",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"{'✅ ' if is_flash_turbo else ''}🚀 Gemini 3.8 Flash (توربو / بدون تفکر)",
+                callback_data="set_cfg:chat:flash_turbo",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"{'✅ ' if is_pro else ''}🧠 Gemini 3.1 Pro Preview (نهایت استدلال)",
+                callback_data="set_cfg:chat:pro",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"🎙️ مدل ویس: {'3.5 Transcribe' if is_trans_35 else '3.8 Flash'} (تغییر)",
+                callback_data="set_cfg:transcribe:toggle",
+            )
+        ],
+        [
+            InlineKeyboardButton("❌ بستن تنظیمات", callback_data="close_settings")
+        ],
+    ]
+    return InlineKeyboardMarkup(buttons)
 
 
 # ==================== توابع کمکی ارسال و ویرایش ایمن پیام در تلگرام ====================
@@ -494,7 +620,7 @@ async def optimize_media_for_fast_upload(raw_bytes: bytes, mime_type: str, is_vi
     return raw_bytes, mime_type
 
 
-# ==================== موتور هوش مصنوعی توربو (Zero-Thinking + Prefix Caching + Hedged Racing) ====================
+# ==================== موتور هوش مصنوعی پیشرفته (Gemini 3.x Series) ====================
 _genai_client: Optional[genai.Client] = None
 
 
@@ -515,21 +641,30 @@ def _candidate_models(primary_model: str) -> list[str]:
     return models
 
 
-def _build_turbo_config(
+def _build_model_config(
     model_name: str,
     system_instruction: Optional[str] = None,
     temperature: float = 0.5,
+    thinking_level: Optional[str] = "HIGH",
+    response_modalities: Optional[list[str]] = None,
 ) -> types.GenerateContentConfig:
-    """ساخت کانفیگ با thinking_budget=0 برای حذف کامل تأخیر تفکر پنهان در مدل‌های سری ۲.۵/۳"""
     kwargs: dict = {"temperature": temperature}
     if system_instruction:
         kwargs["system_instruction"] = system_instruction
+    if response_modalities:
+        kwargs["response_modalities"] = response_modalities
 
-    if ("2.5" in model_name or "3." in model_name) and hasattr(types, "ThinkingConfig"):
+    if hasattr(types, "ThinkingConfig"):
         try:
-            kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
-        except Exception:
-            pass
+            if thinking_level == "OFF":
+                kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+            elif thinking_level in ("HIGH", "MEDIUM", "LOW"):
+                kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
+            elif "2.5" in model_name:
+                kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+        except Exception as e:
+            logger.debug(f"ThinkingConfig setup note: {e}")
+
     return types.GenerateContentConfig(**kwargs)
 
 
@@ -538,18 +673,29 @@ async def _call_single_model(
     contents: list | str,
     system_instruction: Optional[str] = None,
     temperature: float = 0.5,
-) -> str:
+    thinking_level: Optional[str] = "HIGH",
+    response_modalities: Optional[list[str]] = None,
+) -> Any:
     client = get_genai_client()
-    config = _build_turbo_config(
+    config = _build_model_config(
         model_name=model_name,
         system_instruction=system_instruction,
         temperature=temperature,
+        thinking_level=thinking_level,
+        response_modalities=response_modalities,
     )
     response = await client.aio.models.generate_content(
         model=model_name,
         contents=contents,
         config=config,
     )
+    if response_modalities and "AUDIO" in response_modalities:
+        if response and response.candidates and response.candidates[0].content:
+            for part in response.candidates[0].content.parts:
+                if part.inline_data and part.inline_data.data:
+                    return part.inline_data.data
+        raise RuntimeError(f"No audio returned from {model_name}")
+
     if response and response.text and response.text.strip():
         return response.text.strip()
     raise RuntimeError(f"Empty response from {model_name}")
@@ -561,18 +707,24 @@ async def _hedged_generate(
     system_instruction: Optional[str] = None,
     temperature: float = 0.5,
     hedge_delay_sec: float = 3.2,
+    thinking_level: Optional[str] = "HIGH",
 ) -> str:
     """
-    مکانیزم Hedged Request:
-    مدل اول بلافاصله استارت می‌خورد؛ اگر ظرف `hedge_delay_sec` ثانیه جواب نداد،
-    مدل دوم به صورت موازی استارت می‌خورد و هر کدام زودتر جواب داد بلافاصله برگردانده می‌شود.
+    مکانیزم مسابقه موازی و فال‌بک خودکار (Hedged Racing):
+    مدل اصلی شروع می‌شود؛ در صورت تأخیر یا خطای کوئتا، مدل‌های سریع و رزرو سریعاً جایگزین می‌شوند.
     """
     candidates = _candidate_models(primary_model)
     first_model = candidates[0]
     backup_models = candidates[1:]
 
     primary_task = asyncio.create_task(
-        _call_single_model(first_model, contents, system_instruction, temperature)
+        _call_single_model(
+            first_model,
+            contents,
+            system_instruction,
+            temperature,
+            thinking_level=thinking_level,
+        )
     )
 
     try:
@@ -580,19 +732,30 @@ async def _hedged_generate(
         if primary_task in done:
             return primary_task.result()
     except Exception as first_err:
-        logger.warning(f"Primary model {first_model} fast-fail: {sanitize_error_message(first_err)}")
+        logger.warning(f"Primary model {first_model} fail/exhausted: {sanitize_error_message(first_err)}")
         for b_model in backup_models:
             try:
-                return await _call_single_model(b_model, contents, system_instruction, temperature)
+                return await _call_single_model(
+                    b_model,
+                    contents,
+                    system_instruction,
+                    temperature,
+                    thinking_level=thinking_level,
+                )
             except Exception as b_err:
                 logger.warning(f"Backup model {b_model} failed: {sanitize_error_message(b_err)}")
         raise
 
-    # اگر مدل اول هنوز در حال پردازش است، مدل دوم را موازی با آن وارد مسابقه می‌کنیم
     if backup_models:
         second_model = backup_models[0]
         hedge_task = asyncio.create_task(
-            _call_single_model(second_model, contents, system_instruction, temperature)
+            _call_single_model(
+                second_model,
+                contents,
+                system_instruction,
+                temperature,
+                thinking_level=thinking_level,
+            )
         )
         tasks = {primary_task, hedge_task}
         while tasks:
@@ -608,79 +771,164 @@ async def _hedged_generate(
 
         for b_model in backup_models[1:]:
             try:
-                return await _call_single_model(b_model, contents, system_instruction, temperature)
+                return await _call_single_model(
+                    b_model,
+                    contents,
+                    system_instruction,
+                    temperature,
+                    thinking_level=thinking_level,
+                )
             except Exception as err:
                 logger.warning(f"Fallback model {b_model} failed: {sanitize_error_message(err)}")
     else:
         return await primary_task
 
-    raise RuntimeError("خطا در دریافت پاسخ سریع از سرویس Gemini.")
+    raise RuntimeError("خطا در دریافت پاسخ سریع از سرور هوش مصنوعی.")
 
 
-async def transcribe_audio_bytes(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str:
+def _convert_wav_to_ogg_opus_sync(wav_bytes: bytes) -> bytes:
+    """تبدیل صوت WAV به فرمت Opus استاندارد ویس تلگرام با ffmpeg"""
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                "pipe:0",
+                "-c:a",
+                "libopus",
+                "-b:a",
+                "32k",
+                "-f",
+                "ogg",
+                "pipe:1",
+            ],
+            input=wav_bytes,
+            capture_output=True,
+            timeout=10,
+            check=True,
+        )
+        if proc.stdout and len(proc.stdout) > 0:
+            return proc.stdout
+    except Exception as e:
+        logger.warning(f"ffmpeg conversion to ogg failed, using raw: {e}")
+    return wav_bytes
+
+
+async def generate_speech_audio(text: str) -> bytes:
+    """تولید ویس صوتی فوق‌العاده طبیعی با مدل اختصاصی Gemini 3.8 Flash TTS"""
+    clean_text = text.replace("*", "").replace("#", "").strip()[:800]
+    raw_wav_bytes = await _call_single_model(
+        model_name=TTS_MODEL,
+        contents=clean_text,
+        response_modalities=["AUDIO"],
+    )
+    ogg_bytes = await asyncio.to_thread(_convert_wav_to_ogg_opus_sync, raw_wav_bytes)
+    return ogg_bytes
+
+
+async def transcribe_audio_bytes(
+    audio_bytes: bytes,
+    mime_type: str = "audio/ogg",
+    preferred_model: Optional[str] = None,
+) -> str:
     audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)
+    model_to_use = preferred_model or TRANSCRIBE_MODEL
     return await _hedged_generate(
-        primary_model=TRANSCRIBE_MODEL,
+        primary_model=model_to_use,
         contents=[audio_part, "متن این ویس را دقیق بنویس:"],
         system_instruction=TRANSCRIPTION_CLEANUP_PROMPT,
         temperature=0.2,
-        hedge_delay_sec=4.0,
+        hedge_delay_sec=3.8,
+        thinking_level="OFF",
     )
 
 
-async def generate_summary_text(transcript: str) -> str:
+async def generate_summary_text(transcript: str, user_id: Optional[int] = None) -> str:
+    settings = get_user_model_settings(user_id) if user_id else {}
+    model_to_use = settings.get("chat_model") or CHAT_MODEL
+    thinking_level = settings.get("thinking_level") or "HIGH"
+
     return await _hedged_generate(
-        primary_model=CHAT_MODEL,
+        primary_model=model_to_use,
         contents=f"متن ورودی:\n{transcript}",
         system_instruction=SUMMARY_SYSTEM_PROMPT,
         temperature=0.4,
         hedge_delay_sec=2.8,
+        thinking_level=thinking_level,
     )
 
 
-async def generate_human_telegram_reply(transcript: str, variation_hint: str = "") -> str:
+async def generate_human_telegram_reply(
+    transcript: str,
+    variation_hint: str = "",
+    user_id: Optional[int] = None,
+) -> str:
+    settings = get_user_model_settings(user_id) if user_id else {}
+    model_to_use = settings.get("chat_model") or CHAT_MODEL
+    thinking_level = settings.get("thinking_level") or "HIGH"
+
     user_content = f"متن پیام یا ویس مخاطب:\n{transcript}"
     if variation_hint:
         user_content += f"\n\nدستورالعمل تکمیلی:\n{variation_hint}"
 
     raw_reply = await _hedged_generate(
-        primary_model=CHAT_MODEL,
+        primary_model=model_to_use,
         contents=user_content,
         system_instruction=HUMAN_TELEGRAM_REPLY_SYSTEM_PROMPT,
         temperature=0.65,
         hedge_delay_sec=2.8,
+        thinking_level=thinking_level,
     )
     return strip_ai_punctuation_and_artifacts(raw_reply)
 
 
+async def translate_text_content(text: str, user_id: Optional[int] = None) -> str:
+    """ترجمه روان و اصیل با هوش مصنوعی (فارسی به انگلیسی و برعکس)"""
+    settings = get_user_model_settings(user_id) if user_id else {}
+    model_to_use = settings.get("chat_model") or CHAT_MODEL
+    thinking_level = settings.get("thinking_level") or "HIGH"
+
+    return await _hedged_generate(
+        primary_model=model_to_use,
+        contents=f"متن زیر را ترجمه کن:\n{text}",
+        system_instruction=TRANSLATION_SYSTEM_PROMPT,
+        temperature=0.3,
+        hedge_delay_sec=2.8,
+        thinking_level=thinking_level,
+    )
+
+
 # ==================== پیش‌تولید هوشمند در پس‌زمینه (Speculative Background Pre-Generation) ====================
-async def _precompute_reply_for_record(record_id: int, transcript: str) -> str:
+async def _precompute_reply_for_record(record_id: int, transcript: str, user_id: Optional[int] = None) -> str:
     try:
-        reply = await generate_human_telegram_reply(transcript)
+        reply = await generate_human_telegram_reply(transcript, user_id=user_id)
         update_record_field(record_id, "human_reply", reply)
         return reply
     finally:
         _INFLIGHT_REPLY_TASKS.pop(record_id, None)
 
 
-async def _precompute_summary_for_record(record_id: int, transcript: str) -> str:
+async def _precompute_summary_for_record(record_id: int, transcript: str, user_id: Optional[int] = None) -> str:
     try:
-        summary = await generate_summary_text(transcript)
+        summary = await generate_summary_text(transcript, user_id=user_id)
         update_record_field(record_id, "summary", summary)
         return summary
     finally:
         _INFLIGHT_SUMMARY_TASKS.pop(record_id, None)
 
 
-def trigger_background_precomputation(record_id: int, transcript: str) -> None:
+def trigger_background_precomputation(record_id: int, transcript: str, user_id: Optional[int] = None) -> None:
     """تولید خودکار جواب انسانی و خلاصه در پس‌زمینه به محض آماده شدن متن ویس تا دکمه‌ها در ۰.۰۵ ثانیه کار کنند"""
     if record_id not in _INFLIGHT_REPLY_TASKS:
         _INFLIGHT_REPLY_TASKS[record_id] = asyncio.create_task(
-            _precompute_reply_for_record(record_id, transcript)
+            _precompute_reply_for_record(record_id, transcript, user_id=user_id)
         )
     if record_id not in _INFLIGHT_SUMMARY_TASKS:
         _INFLIGHT_SUMMARY_TASKS[record_id] = asyncio.create_task(
-            _precompute_summary_for_record(record_id, transcript)
+            _precompute_summary_for_record(record_id, transcript, user_id=user_id)
         )
 
 
@@ -690,16 +938,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     welcome_text = (
-        "سلام 👋\n"
-        "بات توربو آماده است و با سرعت بالا به دو روش کار می‌کنه:\n\n"
-        "۱. ارسال یا فوروارد ویس (حتی چند ویس همزمان):\n"
-        "در لحظه و به صورت موازی زیرِ هر ویس متن کاملش رو برات می‌نویسم و همزمان در پس‌زمینه «💬 جواب انسانی» و «📝 خلاصه» رو هم آماده می‌کنم تا به محض زدن دکمه، در کسری از ثانیه تحویل بگیری.\n\n"
-        "۲. فوروارد یا ارسال مستقیم پیام متنی:\n"
-        "هر پیام متنی‌ای که برام فوروارد کنی یا بفرستی، درجا پاسخش رو طبق ساختار انسانی تلگرام (بدون علائم نگارشی، بدون تعارف مصنوعی، خونسرد و محاوره‌ای) برات می‌نویسم.\n\n"
-        "💡 نکته: هر وقت روی متن ویس یا پیام ریپلای بزنی و بگی چی می‌خوای بگی (مثلاً: بهش بگو این هفته تابع رو حذف کن)، همون رو با لحن انسانی تلگرامی برات می‌نویسم."
+        "سلام 👋 به ربات هوشمند با موتور نسل جدید Gemini خوش آمدید!\n\n"
+        "🚀 **امکانات قدرتمند ربات:**\n"
+        "۱. **🎙️ رونویسی فوق‌دقیق ویس:** با مدل تخصصی `Gemini 3.5 Transcribe` با دقت خارق‌العاده در درک لحن محاوره‌ای و کلمات تخصصی.\n"
+        "۲. **💬 پاسخ انسانی و خونسرد:** با مدل `Gemini 3.8 Flash (High Thinking)` یا `Gemini 3.1 Pro` بدون علائم نگارشی و تملق.\n"
+        "۳. **🌐 ترجمه هوشمند:** ترجمه بلادرنگ و روان بین فارسی و انگلیسی با پرامپت اختصاصی.\n"
+        "۴. **🔊 تبدیل متن به ویس (TTS):** تولید پیام صوتی طبیعی با مدل پرچمدار `Gemini 3.8 Flash TTS`.\n"
+        "۵. **⚙️ انتخاب و تنظیم مدل:** با دستور `/settings` یا `/model` می‌توانید در هر لحظه مدل یا سطح تفکر را تغییر دهید.\n\n"
+        "💡 **روش استفاده:** کافیست یک ویس، آهنگ یا پیام متنی بفرستید تا فوراً پردازش شود."
     )
     if update.message:
-        await update.message.reply_text(welcome_text)
+        await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
 
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -764,7 +1013,12 @@ async def process_single_voice(update: Update, context: ContextTypes.DEFAULT_TYP
             raw_audio_bytes, mime_type=mime_type, is_video_note=is_video_note
         )
 
-        transcript = await transcribe_audio_bytes(opt_bytes, mime_type=opt_mime)
+        user_cfg = get_user_model_settings(user.id)
+        transcript = await transcribe_audio_bytes(
+            opt_bytes,
+            mime_type=opt_mime,
+            preferred_model=user_cfg.get("transcribe_model"),
+        )
 
         # ذخیره سریع و دریافت record_id
         record_id = save_record(
@@ -775,7 +1029,7 @@ async def process_single_voice(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
         # استارت پیش‌تولید جواب انسانی و خلاصه در پس‌زمینه برای پاسخ آنی به کلیک دکمه‌ها
-        trigger_background_precomputation(record_id, transcript)
+        trigger_background_precomputation(record_id, transcript, user_id=user.id)
 
         await safe_edit_or_send_long_text(
             status_msg=status_msg,
@@ -854,7 +1108,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
             )
             reply_task = asyncio.create_task(
-                generate_human_telegram_reply(base_text, variation_hint=custom_hint)
+                generate_human_telegram_reply(base_text, variation_hint=custom_hint, user_id=user.id)
             )
             wait_msg = await wait_msg_task
             try:
@@ -884,7 +1138,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_to_message_id=message.message_id,
         )
     )
-    reply_task = asyncio.create_task(generate_human_telegram_reply(incoming_text))
+    reply_task = asyncio.create_task(generate_human_telegram_reply(incoming_text, user_id=user.id))
     wait_msg = await wait_msg_task
 
     try:
@@ -907,6 +1161,29 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await wait_msg.edit_text(f"❌ خطا در تولید پاسخ: {sanitize_error_message(e)}")
 
 
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_user_authorized(update):
+        return
+    user = update.effective_user
+    if not user or not update.message:
+        return
+
+    s = get_user_model_settings(user.id)
+    text = (
+        "⚙️ **تنظیمات موتورهای پیشرفته هوش مصنوعی Gemini**\n\n"
+        f"🔹 **مدل فعال چت/پاسخ:** `{s.get('chat_model')}`\n"
+        f"🔹 **سطح تفکر (Thinking Level):** `{s.get('thinking_level')}`\n"
+        f"🔹 **مدل تبدیل ویس (Speech-to-Text):** `{s.get('transcribe_model')}`\n"
+        f"🔹 **مدل تولید ویس (TTS):** `{TTS_MODEL}`\n\n"
+        "برای تغییر مدل یا سرعت تفکر، روی دکمه‌های زیر کلیک کنید:"
+    )
+    await update.message.reply_text(
+        text,
+        reply_markup=build_settings_keyboard(user.id),
+        parse_mode="Markdown",
+    )
+
+
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_user_authorized(update):
         if update.callback_query:
@@ -916,6 +1193,73 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     user = update.effective_user
     if not query or not query.data or not query.message or not user:
+        return
+
+    # ۱. مدیریت پنجره تنظیمات هوش مصنوعی
+    if query.data == "open_settings":
+        s = get_user_model_settings(user.id)
+        text = (
+            "⚙️ **تنظیمات موتورهای هوش مصنوعی**\n\n"
+            f"🔹 **مدل فعال چت/پاسخ:** `{s.get('chat_model')}`\n"
+            f"🔹 **سطح تفکر (Thinking Level):** `{s.get('thinking_level')}`\n"
+            f"🔹 **مدل تبدیل ویس:** `{s.get('transcribe_model')}`\n"
+            f"🔹 **مدل صدا (TTS):** `{TTS_MODEL}`\n\n"
+            "روی هر گزینه برای تغییر وضعیت بزنید:"
+        )
+        await query.message.reply_text(
+            text,
+            reply_markup=build_settings_keyboard(user.id),
+            parse_mode="Markdown",
+        )
+        await query.answer()
+        return
+
+    if query.data == "close_settings":
+        try:
+            await query.message.delete()
+        except Exception:
+            await query.message.edit_text("تنظیمات بسته شد.")
+        await query.answer("بسته شد.")
+        return
+
+    if query.data.startswith("set_cfg:"):
+        _, target, mode = query.data.split(":", 2)
+        if target == "chat":
+            if mode == "flash_high":
+                update_user_setting(user.id, "chat_model", "gemini-3.8-flash")
+                update_user_setting(user.id, "thinking_level", "HIGH")
+                await query.answer("✅ Gemini 3.8 Flash (تفکر عمیق High) انتخاب شد!", show_alert=False)
+            elif mode == "flash_turbo":
+                update_user_setting(user.id, "chat_model", "gemini-3.8-flash")
+                update_user_setting(user.id, "thinking_level", "OFF")
+                await query.answer("🚀 Gemini 3.8 Flash (توربو بدون تفکر) انتخاب شد!", show_alert=False)
+            elif mode == "pro":
+                update_user_setting(user.id, "chat_model", "gemini-3.1-pro-preview")
+                update_user_setting(user.id, "thinking_level", "HIGH")
+                await query.answer("🧠 Gemini 3.1 Pro Preview (نهایت استدلال) انتخاب شد!", show_alert=False)
+        elif target == "transcribe" and mode == "toggle":
+            curr = get_user_model_settings(user.id).get("transcribe_model")
+            new_m = "gemini-3.8-flash" if curr == "gemini-3.5-transcribe" else "gemini-3.5-transcribe"
+            update_user_setting(user.id, "transcribe_model", new_m)
+            await query.answer(f"🎙️ مدل ویس تغییر کرد به:\n{new_m}", show_alert=False)
+
+        s = get_user_model_settings(user.id)
+        updated_text = (
+            "⚙️ **تنظیمات موتورهای هوش مصنوعی**\n\n"
+            f"🔹 **مدل فعال چت/پاسخ:** `{s.get('chat_model')}`\n"
+            f"🔹 **سطح تفکر (Thinking Level):** `{s.get('thinking_level')}`\n"
+            f"🔹 **مدل تبدیل ویس:** `{s.get('transcribe_model')}`\n"
+            f"🔹 **مدل صدا (TTS):** `{TTS_MODEL}`\n\n"
+            "روی هر گزینه برای تغییر وضعیت بزنید:"
+        )
+        try:
+            await query.message.edit_text(
+                updated_text,
+                reply_markup=build_settings_keyboard(user.id),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
         return
 
     if is_rate_limited(user.id):
@@ -937,7 +1281,6 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     voice_msg_id = record["voice_msg_id"]
 
     if action == "sum":
-        # ۱. اگر در کش RAM/DB از پیش آماده شده، در ۰.۰۵ ثانیه بدون پیام انتظار ارسال کن!
         if record.get("summary"):
             await query.answer("⚡ خلاصه آماده است!")
             await query.message.reply_text(
@@ -953,9 +1296,10 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                 reply_to_message_id=voice_msg_id,
             )
         )
-        # اگر تسک پس‌زمینه از قبل در حال اجراست، به همان وصل شو به جای ارسال درخواست تکراری
         inflight = _INFLIGHT_SUMMARY_TASKS.get(record_id)
-        summary_task = inflight if inflight else asyncio.create_task(_precompute_summary_for_record(record_id, transcript))
+        summary_task = inflight if inflight else asyncio.create_task(
+            _precompute_summary_for_record(record_id, transcript, user_id=user.id)
+        )
         wait_msg = await wait_msg_task
         try:
             summary = await summary_task
@@ -969,7 +1313,6 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             await wait_msg.edit_text(f"❌ خطا در خلاصه‌سازی: {sanitize_error_message(e)}")
 
     elif action == "reply":
-        # اگر جواب انسانی توسط پیش‌تولید پس‌زمینه آماده شده، درجا بدون انتظار نمایش بده!
         if record.get("human_reply"):
             await query.answer("⚡ جواب آماده است!")
             sent = await query.message.reply_text(
@@ -988,7 +1331,9 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             )
         )
         inflight = _INFLIGHT_REPLY_TASKS.get(record_id)
-        reply_task = inflight if inflight else asyncio.create_task(_precompute_reply_for_record(record_id, transcript))
+        reply_task = inflight if inflight else asyncio.create_task(
+            _precompute_reply_for_record(record_id, transcript, user_id=user.id)
+        )
         wait_msg = await wait_msg_task
         try:
             human_reply = await reply_task
@@ -1001,6 +1346,60 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             )
         except Exception as e:
             await wait_msg.edit_text(f"❌ خطا در تولید جواب انسانی: {sanitize_error_message(e)}")
+
+    elif action == "trans":
+        base_for_trans = record.get("human_reply") or transcript
+        if record.get("translation"):
+            await query.answer("⚡ ترجمه آماده است!")
+            await query.message.reply_text(
+                f"🌐 ترجمه:\n\n{record['translation'][:3900]}",
+                reply_to_message_id=voice_msg_id,
+            )
+            return
+
+        await query.answer("🌐 در حال ترجمه هوشمند...")
+        wait_msg_task = asyncio.create_task(
+            query.message.reply_text(
+                "🌐 در حال ترجمه هوشمند با Gemini...",
+                reply_to_message_id=voice_msg_id,
+            )
+        )
+        trans_task = asyncio.create_task(translate_text_content(base_for_trans, user_id=user.id))
+        wait_msg = await wait_msg_task
+        try:
+            translated = await trans_task
+            update_record_field(record_id, "translation", translated)
+            await safe_edit_or_send_long_text(
+                status_msg=wait_msg,
+                origin_msg=query.message,
+                full_text=translated,
+                header_prefix="🌐 ترجمه:\n\n",
+            )
+        except Exception as e:
+            await wait_msg.edit_text(f"❌ خطا در ترجمه: {sanitize_error_message(e)}")
+
+    elif action == "tts":
+        text_to_speak = record.get("human_reply") or transcript
+        await query.answer("🔊 در حال تولید ویس صوتی با Gemini 3.8 Flash TTS...")
+        wait_msg_task = asyncio.create_task(
+            query.message.reply_text(
+                "🔊 در حال تولید فایل صوتی با مدل Gemini 3.8 Flash TTS...",
+                reply_to_message_id=voice_msg_id,
+            )
+        )
+        tts_task = asyncio.create_task(generate_speech_audio(text_to_speak))
+        wait_msg = await wait_msg_task
+        try:
+            ogg_bytes = await tts_task
+            await query.message.reply_voice(
+                voice=io.BytesIO(ogg_bytes),
+                reply_to_message_id=voice_msg_id,
+                caption="🔊 ویس تولیدشده با مدل پرچمدار Gemini 3.8 Flash TTS",
+            )
+            await wait_msg.delete()
+        except Exception as e:
+            logger.error(f"TTS error: {sanitize_error_message(e)}")
+            await wait_msg.edit_text(f"❌ خطا در تولید ویس صوتی: {sanitize_error_message(e)}")
 
     elif action == "regen":
         await query.answer("🔄 در حال نوشتن یک مدل جدید...")
@@ -1015,7 +1414,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             )
         )
         reply_task = asyncio.create_task(
-            generate_human_telegram_reply(transcript, variation_hint=hint)
+            generate_human_telegram_reply(transcript, variation_hint=hint, user_id=user.id)
         )
         wait_msg = await wait_msg_task
         try:
@@ -1044,7 +1443,7 @@ def main() -> None:
     except Exception:
         pass
 
-    logger.info("Starting @voiceandpasokhbot (5x Turbo Ultra-Fast Edition)...")
+    logger.info("Starting @voiceandpasokhbot (Gemini 3.x Power Edition)...")
 
     # تنظیم استخر کانکشن بزرگ و HTTP/2 برای حذف تأخیرهای شبکه در ارتباط با سرور تلگرام
     try:
@@ -1083,6 +1482,10 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", start_command))
     app.add_handler(CommandHandler("id", id_command))
+    app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CommandHandler("model", settings_command))
+    app.add_handler(CommandHandler("models", settings_command))
+    app.add_handler(CommandHandler("mode", settings_command))
 
     app.add_handler(
         MessageHandler(
