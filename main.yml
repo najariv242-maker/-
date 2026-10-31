@@ -14,7 +14,7 @@ permissions:
   contents: read
   actions: write
 
-# cancel-in-progress باید false باشد تا وقتی گام آخر سیکل بعدی را استارت می‌زند، سیکل فعلی وسط ذخیره دیتابیس کنسل نشود
+# cancel-in-progress باید false باشد تا وقتی گام آخر سیکل بعدی را استارت می‌زند، سیکل فعلی وسط مراحل Post کنسل نشود
 concurrency:
   group: voiceandpasokhbot-live-runner
   cancel-in-progress: false
@@ -59,15 +59,14 @@ jobs:
             openssl enc -d -aes-256-cbc -pbkdf2 -in voice_bot.db.enc -out voice_bot.db -pass env:CACHE_KEY_SECRET || rm -f voice_bot.db
           fi
 
-      - name: 🔥 اجرای ۲۴/۷ با مکانیزم ترکیبی Hot-Reload و Watchdog (ضد کرش و بدون نیاز به تعریف متغیر در گیت‌هاب)
+      - name: 🔥 اجرای ۲۴/۷ با مکانیزم ترکیبی Hot-Reload و Watchdog (ضد کرش و بدون افشای توکن)
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           ALLOWED_USER_IDS: ${{ secrets.ALLOWED_USER_IDS }}
           PRIVATE_CHAT_ONLY: "true"
-          TRANSCRIBE_MODEL: "gemini-3.5-transcribe"
-          CHAT_MODEL: "gemini-3.5-flash-lite"
+          TRANSCRIBE_MODEL: "gemini-2.5-flash"
+          CHAT_MODEL: "gemini-2.5-flash"
           DB_PATH: "voice_bot.db"
         run: |
           chmod +x run_workflow.sh
@@ -93,7 +92,7 @@ jobs:
           key: voice-bot-db-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: 🔄 استارت خودکار سیکل بعدی بدون قطعی (Self Re-Trigger)
-        if: ${{ !cancelled() }}
+        if: ${{ success() }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

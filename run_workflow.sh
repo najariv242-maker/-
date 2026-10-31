@@ -3,7 +3,7 @@ set -u
 
 echo "===================================================="
 echo "🚀 Starting 24/7 Live Hot-Reload & Watchdog Runner"
-echo "🤖 Bot: @voiceandpasokhbot (v3.0 Zero-Error Edition)"
+echo "🤖 Bot: @voiceandpasokhbot (Public-Safe Edition)"
 echo "===================================================="
 
 # زمان اجرای هر سیکل (حدود 340 دقیقه، قبل از تایم‌اوت 350 دقیقه‌ای گیت‌هاب اکشنز)
@@ -18,27 +18,6 @@ fi
 LAST_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "initial")
 POLL_COUNTER=0
 
-stop_bot() {
-    if [ -n "$BOT_PID" ] && kill -0 "$BOT_PID" 2>/dev/null; then
-        echo "⏹️ Stopping bot cleanly (PID: $BOT_PID)..."
-        kill -INT "$BOT_PID" 2>/dev/null || kill -TERM "$BOT_PID" 2>/dev/null || true
-        for _ in 1 2 3 4 5 6; do
-            if ! kill -0 "$BOT_PID" 2>/dev/null; then
-                break
-            fi
-            sleep 1
-        done
-        if kill -0 "$BOT_PID" 2>/dev/null; then
-            kill -9 "$BOT_PID" 2>/dev/null || true
-        fi
-        wait "$BOT_PID" 2>/dev/null || true
-        # مکث کوتاه برای بسته شدن کامل کانکشن getUpdates در سمت سرور تلگرام (جلوگیری از خطای 409)
-        sleep 1
-    fi
-    # اطمینان از عدم وجود پروسه یتیم از قبل
-    pkill -f "python3 bot.py" 2>/dev/null || true
-}
-
 start_bot() {
     echo "▶️ [$(date '+%Y-%m-%d %H:%M:%S')] Launching bot.py..."
     python3 bot.py &
@@ -46,9 +25,23 @@ start_bot() {
     echo "✅ Bot started with PID: $BOT_PID"
 }
 
+stop_bot() {
+    if [ -n "$BOT_PID" ] && kill -0 "$BOT_PID" 2>/dev/null; then
+        echo "⏹️ Stopping bot (PID: $BOT_PID)..."
+        kill -TERM "$BOT_PID" 2>/dev/null || true
+        for _ in 1 2 3 4; do
+            if ! kill -0 "$BOT_PID" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+        done
+        kill -9 "$BOT_PID" 2>/dev/null || true
+        wait "$BOT_PID" 2>/dev/null || true
+    fi
+}
+
 trap 'stop_bot; exit 0' SIGINT SIGTERM
 
-stop_bot
 start_bot
 
 # حلقه ترکیبی Watchdog (بررسی هر ۵ ثانیه) و Hot-Reload (بررسی آپدیت گیت‌هاب هر ۶۰ ثانیه)
@@ -64,12 +57,12 @@ while true; do
 
     # 1. بررسی زنده بودن بات (Watchdog)
     if ! kill -0 "$BOT_PID" 2>/dev/null; then
-        echo "⚠️ [Watchdog] bot.py exited! Restarting in 2 seconds..."
-        sleep 2
+        echo "⚠️ [Watchdog] bot.py exited! Restarting in 3 seconds..."
+        sleep 3
         start_bot
     fi
 
-    # 2. بررسی تغییرات مخزن گیت‌هاب هر 60 ثانیه (12 سیکل 5 ثانیه‌ای)
+    # 2. بررسی تغییرات مخزن گیت‌هاب هر 60 ثانیه (12 سیکل 5 ثانیه‌ای) و جلوگیری از حلقه بی‌نهایت
     POLL_COUNTER=$((POLL_COUNTER + 1))
     if [ $((POLL_COUNTER % 12)) -eq 0 ]; then
         if git fetch origin "$BRANCH_NAME" --quiet 2>/dev/null; then
@@ -84,6 +77,7 @@ while true; do
                     stop_bot
                     start_bot
                 else
+                    # حتی در صورت عدم موفقیت مرج، LAST_COMMIT را آپدیت می‌کنیم تا وارد حلقه بی‌نهایت ری‌استارت نشود
                     LAST_COMMIT="$REMOTE_COMMIT"
                 fi
             fi
