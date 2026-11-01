@@ -2,18 +2,27 @@
 # -*- coding: utf-8 -*-
 """
 ربات تلگرام تبدیل فوق‌سریع ویس به متن + پاسخ‌گوی انسانی (@voiceandpasokhbot)
-نسخه نهایی توربو (5x-10x Ultra-Fast + Zero-Config + Public Repo Safe + Anti-Spam):
-۱۰ بهینه‌سازی سرعت اعمال‌شده در این نسخه:
-1. غیرفعال‌سازی Thinking Mode (`thinking_budget=0`) برای حذف ۴ تا ۸ ثانیه تأخیر تفکر داخلی مدل‌های Gemini 2.5
-2. اجرای موازی (`asyncio.gather`) ارسال پیام وضعیت تلگرام و دانلود/پردازش هوش مصنوعی (حذف تأخیر سریالی شبکه)
-3. پیش‌تولید هوشمند در پس‌زمینه (`Speculative Background Pre-Generation`): تولید همزمان خلاصه و جواب انسانی در پس‌زمینه به محض آماده شدن متن ویس برای پاسخ ۰.۰۵ ثانیه‌ای به دکمه‌ها
-4. مسابقه مدل‌های موازی (`Hedged Model Racing`): استارت خودکار مدل کمکی در صورت تأخیر بیش از ۳.۵ ثانیه در سرور گوگل
-5. کش درون‌حافظه‌ای (`In-Memory LRU RAM Cache`) + کانکشن دائمی SQLite و ذخیره غیرمسدودکننده بعد از نمایش پیام به کاربر
-6. انتقال دستورالعمل‌های ثابت به `system_instruction` برای فعال‌سازی کش سمت سرور گوگل (`Implicit Prefix Caching`)
-7. فشرده‌سازی صوت در حافظه (`In-Memory 16kHz Mono Opus ffmpeg Pipe`) برای ویدیومسیج‌ها و فایل‌های صوتی حجیم
-8. ارتباط مالتی‌پلکس `HTTP/2` با استخر ۶۴ کانکشن باز (`connection_pool_size=64`) و `poll_interval=0.1`
-9. موتور رویداد `uvloop` مبتنی بر Cython/libuv برای شتاب‌دهی ۲ تا ۴ برابری شبکه در لینوکس
-10. عبارات باقاعده پیش‌کامپایل‌شده (`Pre-Compiled Regex`) و جدول ترجمه `str.translate` سطح C
+نسخه مجهز به معماری پایپ‌لاین دو مرحله‌ای (Two-Stage Pipeline) و مدیریت هوشمند خطای 429 با ۳ کلید مجزا [KEY_1, KEY_2, KEY_3]:
+
+۱. مرحله اول — تبدیل ویس به متن (Audio-to-Text Pipeline):
+   - اولویت اول: "gemini-3.5-transcribe" (تخصصی صوت)
+   - اولویت دوم: "gemini-3.5-flash-lite" (فوق‌العاده سریع با سهمیه بالا)
+   - اولویت سوم: "gemini-3.1-flash-lite" (پشتیبان نهایی)
+   - چرخش آنی کلیدها در خطای 429: KEY_1 -> KEY_2 -> KEY_3 و ریست به KEY_1 در زمان سوییچ به مدل بعدی
+   - ارسال خودکار پرامپت اختصاصی برای مدل‌های سری Flash Lite:
+     "متن این فایل صوتی را دقیق، کلمه به کلمه و بدون هیچ توضیح اضافه پیاده کن."
+
+۲. مرحله دوم — تولید پاسخ متنی چت (Chat Pipeline):
+   - اولویت اول: "gemini-3.5-flash-lite" (پاسخ‌دهی آنی و کمترین تاخیر)
+   - اولویت دوم: "gemini-3.1-flash-lite" (جایگزین سریع با سهمیه بالا)
+   - اولویت سوم: "gemini-3.8-flash" (مدل هوشمندتر و قوی‌تر برای پاسخ‌های تحلیلی/طولانی)
+   - چرخش آنی کلیدها در خطای 429: KEY_1 -> KEY_2 -> KEY_3 و ریست به KEY_1 در مدل بعدی
+
+۳. الزامات فنی رعایت‌شده:
+   - دو کلاس مستقل و ماژولار (AudioToTextPipeline و ChatPipeline) با مدیریت Try/Except اختصاصی برای 429
+   - عدم ورود خطاهای غیر 429 (شبکه، فرمت فایل، کلید نامعتبر و غیره) به چرخه تعویض کلید (لاگ و Raise فوری)
+   - ذخیره وضعیت آخرین کلید و مدل موفق در حافظه و دیتابیس SQLite + شروع هوشمند از اولویت اول
+   - لاگ شفاف و دقیق از وضعیت سوییچ بین کلیدها و مدل‌ها با مخفی‌سازی کامل مقادیر محرمانه کلیدها
 """
 
 from __future__ import annotations
@@ -21,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import OrderedDict, defaultdict
+from dataclasses import dataclass
 import io
 import logging
 import os
@@ -29,7 +39,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 import zlib
 
 # فعال‌سازی موتور فوق‌سریع uvloop در لینوکس در صورت نصب بودن
@@ -57,7 +67,6 @@ from google.genai import types
 
 from humanizer_skill import (
     HUMAN_TELEGRAM_REPLY_SYSTEM_PROMPT,
-    HUMANIZE_RAW_TEXT_SYSTEM_PROMPT,
     SUMMARY_SYSTEM_PROMPT,
     TRANSCRIPTION_CLEANUP_PROMPT,
     TRANSLATION_SYSTEM_PROMPT,
@@ -81,8 +90,49 @@ def _decode_runtime_secret(enc_str: str) -> str:
 
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip() or _decode_runtime_secret(_FALLBACK_T_ENC)
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip() or _decode_runtime_secret(_FALLBACK_G_ENC)
 DB_PATH = os.getenv("DB_PATH", "voice_bot.db").strip()
+
+
+# ==================== مشخصات ۳ کلید مجزا: [KEY_1, KEY_2, KEY_3] ====================
+def _resolve_three_api_keys() -> List[str]:
+    """
+    استخراج ۳ کلید مجزا [KEY_1, KEY_2, KEY_3]:
+    پشتیبانی از متغیرهای محیطی KEY_1..3، GEMINI_API_KEY_1..3، یا لیست جداشده با ویرگول در GEMINI_API_KEYS / GEMINI_API_KEY.
+    اگر کاربر فقط یک یا دو کلید تنظیم کرده باشد، اسلات‌های باقی‌مانده با کلید اول پر می‌شوند تا هرگز خطای 400 کلید خالی رخ ندهد.
+    """
+    raw_multi = (
+        os.getenv("GEMINI_API_KEYS", "").strip()
+        or os.getenv("GEMINI_API_KEY", "").strip()
+    )
+    split_keys: List[str] = []
+    if "," in raw_multi or ";" in raw_multi:
+        split_keys = [k.strip() for k in re.split(r"[,;\s]+", raw_multi) if k.strip()]
+
+    k1 = (
+        os.getenv("KEY_1", "").strip()
+        or os.getenv("GEMINI_API_KEY_1", "").strip()
+        or (split_keys[0] if len(split_keys) >= 1 else "")
+        or (raw_multi if not split_keys else "")
+        or _decode_runtime_secret(_FALLBACK_G_ENC)
+    )
+    k2 = (
+        os.getenv("KEY_2", "").strip()
+        or os.getenv("GEMINI_API_KEY_2", "").strip()
+        or (split_keys[1] if len(split_keys) >= 2 else "")
+        or k1
+    )
+    k3 = (
+        os.getenv("KEY_3", "").strip()
+        or os.getenv("GEMINI_API_KEY_3", "").strip()
+        or (split_keys[2] if len(split_keys) >= 3 else "")
+        or k1
+    )
+    return [k1, k2, k3]
+
+
+KEY_1, KEY_2, KEY_3 = _resolve_three_api_keys()
+API_KEYS: List[str] = [KEY_1, KEY_2, KEY_3]
+GEMINI_API_KEY: str = KEY_1
 
 RAW_ALLOWED_IDS = os.getenv("ALLOWED_USER_IDS", "").strip()
 ALLOWED_USER_IDS: Set[int] = {
@@ -98,31 +148,50 @@ RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 MAX_TELEGRAM_FILE_SIZE_BYTES = 20 * 1024 * 1024
 TELEGRAM_MAX_MSG_LENGTH = 4000
 
-# مدل‌های نسل جدید هوش مصنوعی گوگل با بالاترین کیفیت و کارایی (Gemini 3.x Series)
-TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "gemini-3.5-transcribe").strip()
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-3.8-flash").strip()
-TTS_MODEL = os.getenv("TTS_MODEL", "gemini-3.8-flash-tts").strip()
-TRANSLATE_MODEL = os.getenv("TRANSLATE_MODEL", "gemini-3.8-flash").strip()
+# ==================== ترتیب اولویت مدل‌ها در دو مرحله (Pipeline Model Priorities) ====================
 
-FAST_MODELS = (
-    "gemini-3.8-flash",
-    "gemini-3.5-transcribe",
-    "gemini-3.1-pro-preview",
+# ۱. مرحله تبدیل ویس به متن (Audio-to-Text Pipeline)
+AUDIO_PIPELINE_MODELS: Tuple[str, ...] = (
+    "gemini-3.5-transcribe",   # اولویت اول: تخصصی صوت
+    "gemini-3.5-flash-lite",   # اولویت دوم: فوق‌العاده سریع با سهمیه بالا
+    "gemini-3.1-flash-lite",   # اولویت سوم: پشتیبان نهایی
+)
+
+# پرامپت الزامی برای مدل‌های سری Flash Lite در مرحله تبدیل ویس به متن
+FLASH_LITE_TRANSCRIPTION_PROMPT: str = (
+    "متن این فایل صوتی را دقیق، کلمه به کلمه و بدون هیچ توضیح اضافه پیاده کن."
+)
+
+# ۲. مرحله تولید پاسخ متنی چت (Chat Pipeline)
+CHAT_PIPELINE_MODELS: Tuple[str, ...] = (
+    "gemini-3.5-flash-lite",   # اولویت اول: پاسخ‌دهی آنی و کمترین تاخیر
+    "gemini-3.1-flash-lite",   # اولویت دوم: جایگزین سریع با سهمیه بالا
+    "gemini-3.8-flash",        # اولویت سوم: مدل هوشمندتر و قوی‌تر برای پاسخ‌های تحلیلی/طولانی
+)
+
+TRANSCRIBE_MODEL: str = AUDIO_PIPELINE_MODELS[0]
+CHAT_MODEL: str = CHAT_PIPELINE_MODELS[0]
+TTS_MODEL: str = os.getenv("TTS_MODEL", "gemini-3.8-flash-tts").strip()
+TRANSLATE_MODEL: str = CHAT_PIPELINE_MODELS[0]
+
+# آیا در هر اجرا به صورت هوشمند از اولویت اول شروع کند (True) یا از آخرین کلید/مدل موفق ادامه دهد (False)
+PIPELINE_START_FROM_FIRST: bool = (
+    os.getenv("PIPELINE_START_FROM_FIRST", "true").strip().lower() in ("1", "true", "yes")
 )
 
 # آستانه حجم فایل برای فشرده‌سازی سریع با ffmpeg در حافظه (۳۵۰ کیلوبایت)
 FFMPEG_COMPRESS_THRESHOLD_BYTES = 350 * 1024
 
 
-# ==================== فیلتر امنیتی لاگ‌ها (جلوگیری از لو رفتن توکن در لاگ پابلیک گیت‌هاب) ====================
+# ==================== فیلتر امنیتی لاگ‌ها (جلوگیری از لو رفتن توکن و هر ۳ کلید در لاگ پابلیک) ====================
 _RE_BOT_TOKEN_MASK = re.compile(r"bot\d{8,12}:[A-Za-z0-9_-]{30,}")
 _RE_KEY_PARAM_MASK = re.compile(r"key=[A-Za-z0-9_\-\.]+")
 
 
 class SecretMaskingFilter(logging.Filter):
-    """مخفی‌سازی کامل BOT_TOKEN و GEMINI_API_KEY در تمام لاگ‌های کنسول گیت‌هاب اکشنز"""
+    """مخفی‌سازی کامل BOT_TOKEN و هر ۳ کلید [KEY_1, KEY_2, KEY_3] در تمام لاگ‌ها"""
 
-    def __init__(self, secrets_to_mask: list[str]) -> None:
+    def __init__(self, secrets_to_mask: Sequence[str]) -> None:
         super().__init__()
         self.secrets = [s for s in secrets_to_mask if s and len(s) > 6]
 
@@ -132,6 +201,7 @@ class SecretMaskingFilter(logging.Filter):
             if secret in masked:
                 masked = masked.replace(secret, "***REDACTED_SECRET***")
         masked = _RE_BOT_TOKEN_MASK.sub("bot***REDACTED***", masked)
+        masked = _RE_KEY_PARAM_MASK.sub("key=***REDACTED***", masked)
         return masked
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -153,12 +223,22 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 
-secret_filter = SecretMaskingFilter([BOT_TOKEN, GEMINI_API_KEY])
+secret_filter = SecretMaskingFilter([BOT_TOKEN, KEY_1, KEY_2, KEY_3])
 for handler in logging.root.handlers:
     handler.addFilter(secret_filter)
 
 logger = logging.getLogger("VoiceAndPasokhBot")
 logger.addFilter(secret_filter)
+
+
+def sanitize_error_message(err: BaseException) -> str:
+    msg = str(err)
+    for s in (BOT_TOKEN, KEY_1, KEY_2, KEY_3):
+        if s:
+            msg = msg.replace(s, "***")
+    msg = _RE_BOT_TOKEN_MASK.sub("bot***", msg)
+    msg = _RE_KEY_PARAM_MASK.sub("key=***", msg)
+    return msg[:180]
 
 
 # ==================== سیستم ضد تبلیغات، ضد اسپم و کنترل دسترسی ====================
@@ -213,25 +293,13 @@ def is_advertising_or_spam(text: str, user_id: int) -> bool:
     return False
 
 
-def sanitize_error_message(err: Exception) -> str:
-    msg = str(err)
-    for s in (BOT_TOKEN, GEMINI_API_KEY):
-        if s:
-            msg = msg.replace(s, "***")
-    msg = _RE_BOT_TOKEN_MASK.sub("bot***", msg)
-    msg = _RE_KEY_PARAM_MASK.sub("key=***", msg)
-    return msg[:160]
-
-
 # ==================== کش فوق‌سریع RAM (LRU Cache) + دیتابیس دائمی SQLite ====================
 MAX_RAM_CACHE_SIZE = 500
 _RAM_RECORDS_BY_ID: OrderedDict[int, dict] = OrderedDict()
 _RAM_MSG_TO_RECORD_ID: OrderedDict[tuple[int, int], int] = OrderedDict()
 _PERSISTENT_DB_CONN: Optional[sqlite3.Connection] = None
-# نگهداری تسک‌های پیش‌تولید در پس‌زمینه تا اگر کاربر زودتر کلیک کرد، به همان تسک در حال اجرا وصل شود
 _INFLIGHT_REPLY_TASKS: dict[int, asyncio.Task] = {}
 _INFLIGHT_SUMMARY_TASKS: dict[int, asyncio.Task] = {}
-_INFLIGHT_HUMANIZE_TASKS: dict[int, asyncio.Task] = {}
 
 
 def _get_db_connection() -> sqlite3.Connection:
@@ -276,7 +344,6 @@ def init_db() -> None:
             transcript TEXT NOT NULL,
             summary TEXT,
             human_reply TEXT,
-            humanized_text TEXT,
             translation TEXT,
             created_at REAL NOT NULL
         )
@@ -288,17 +355,46 @@ def init_db() -> None:
         cursor.execute("ALTER TABLE voice_records ADD COLUMN bot_msg_id INTEGER")
     if "translation" not in existing_cols:
         cursor.execute("ALTER TABLE voice_records ADD COLUMN translation TEXT")
-    if "humanized_text" not in existing_cols:
-        cursor.execute("ALTER TABLE voice_records ADD COLUMN humanized_text TEXT")
 
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS user_settings (
             user_id INTEGER PRIMARY KEY,
-            chat_model TEXT DEFAULT 'gemini-3.8-flash',
-            thinking_level TEXT DEFAULT 'HIGH',
+            chat_model TEXT DEFAULT 'gemini-3.5-flash-lite',
+            thinking_level TEXT DEFAULT 'OFF',
             transcribe_model TEXT DEFAULT 'gemini-3.5-transcribe'
         )
+        """
+    )
+
+    # جدول ذخیره وضعیت آخرین کلید و مدل موفق پایپ‌لاین‌ها (الزام فنی ۳)
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pipeline_state (
+            pipeline_name TEXT PRIMARY KEY,
+            last_successful_model TEXT,
+            last_successful_key_index INTEGER DEFAULT 0,
+            last_successful_key_label TEXT DEFAULT 'KEY_1',
+            last_success_timestamp REAL DEFAULT 0.0,
+            total_requests INTEGER DEFAULT 0,
+            total_429_switches INTEGER DEFAULT 0
+        )
+        """
+    )
+
+    # مهاجرت خودکار رکوردهای قدیمی که روی gemini-2.5-flash مانده بودند به اولویت اول پایپ‌لاین جدید
+    cursor.execute(
+        """
+        UPDATE user_settings
+        SET chat_model = 'gemini-3.5-flash-lite'
+        WHERE chat_model NOT IN ('gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.8-flash')
+        """
+    )
+    cursor.execute(
+        """
+        UPDATE user_settings
+        SET transcribe_model = 'gemini-3.5-transcribe'
+        WHERE transcribe_model NOT IN ('gemini-3.5-transcribe', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite')
         """
     )
 
@@ -309,6 +405,522 @@ def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_chat_bot_msg ON voice_records(chat_id, bot_msg_id)"
     )
     conn.commit()
+
+
+# ==================== ماژول دو مرحله‌ای (Two-Stage Pipeline) با مدیریت اختصاصی 429 ====================
+
+
+class AllModelsAndKeysExhaustedError(RuntimeError):
+    """زمانی رخ می‌دهد که هر ۳ کلید [KEY_1, KEY_2, KEY_3] روی تمام مدل‌های اولویت خطای 429 بدهند."""
+
+    def __init__(self, pipeline_name: str, attempts: int, last_error: Optional[BaseException] = None) -> None:
+        self.pipeline_name = pipeline_name
+        self.attempts = attempts
+        self.last_error = last_error
+        super().__init__(
+            f"[{pipeline_name}] سهمیه تمامی کلیدها [KEY_1..KEY_3] و مدل‌ها پس از {attempts} تلاش به اتمام رسید (429)."
+        )
+
+
+def is_http_429_error(exc: BaseException) -> bool:
+    """
+    تشخیص اختصاصی خطای 429 (Resource Exhausted / Rate Limit / Quota Exceeded).
+    سایر خطاها (مانند خطای شبکه، فرمت فایل، 400، 401، 403، 404، 500) False برمی‌گردانند
+    تا طبق الزام فنی ۲ وارد چرخه تعویض کلید نشوند و فوراً لاگ و Raise گردند.
+    """
+    for attr in ("code", "status_code", "http_status", "status"):
+        val = getattr(exc, attr, None)
+        if val == 429 or str(val) == "429":
+            return True
+        if isinstance(val, str) and "RESOURCE_EXHAUSTED" in val.upper():
+            return True
+
+    msg = str(exc).upper()
+    if re.search(r"\b429\b", msg):
+        return True
+    if any(
+        token in msg
+        for token in (
+            "RESOURCE_EXHAUSTED",
+            "RATE_LIMIT",
+            "RATE LIMIT",
+            "QUOTA EXCEEDED",
+            "QUOTA_EXCEEDED",
+            "TOO MANY REQUESTS",
+        )
+    ):
+        return True
+    return False
+
+
+@dataclass
+class PipelineExecutionState:
+    """نگهداری و ذخیره وضعیت آخرین کلید و مدل موفق"""
+
+    pipeline_name: str
+    last_successful_model: Optional[str] = None
+    last_successful_key_index: int = 0
+    last_successful_key_label: str = "KEY_1"
+    last_success_timestamp: float = 0.0
+    total_requests: int = 0
+    total_429_switches: int = 0
+
+    def record_success(self, model_name: str, key_index: int, key_label: str) -> None:
+        self.last_successful_model = model_name
+        self.last_successful_key_index = key_index
+        self.last_successful_key_label = key_label
+        self.last_success_timestamp = time.time()
+        self.total_requests += 1
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "pipeline_name": self.pipeline_name,
+            "last_successful_model": self.last_successful_model,
+            "last_successful_key_index": self.last_successful_key_index,
+            "last_successful_key_label": self.last_successful_key_label,
+            "last_success_timestamp": self.last_success_timestamp,
+            "total_requests": self.total_requests,
+            "total_429_switches": self.total_429_switches,
+        }
+
+
+def _persist_pipeline_state_to_db(state: PipelineExecutionState) -> None:
+    """ذخیره وضعیت آخرین کلید و مدل موفق در دیتابیس SQLite (الزام فنی ۳)"""
+    try:
+        conn = _get_db_connection()
+        conn.execute(
+            """
+            INSERT INTO pipeline_state (
+                pipeline_name,
+                last_successful_model,
+                last_successful_key_index,
+                last_successful_key_label,
+                last_success_timestamp,
+                total_requests,
+                total_429_switches
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(pipeline_name) DO UPDATE SET
+                last_successful_model = excluded.last_successful_model,
+                last_successful_key_index = excluded.last_successful_key_index,
+                last_successful_key_label = excluded.last_successful_key_label,
+                last_success_timestamp = excluded.last_success_timestamp,
+                total_requests = excluded.total_requests,
+                total_429_switches = excluded.total_429_switches
+            """,
+            (
+                state.pipeline_name,
+                state.last_successful_model,
+                state.last_successful_key_index,
+                state.last_successful_key_label,
+                state.last_success_timestamp,
+                state.total_requests,
+                state.total_429_switches,
+            ),
+        )
+        conn.commit()
+    except Exception as e:
+        logger.debug(f"Could not persist pipeline state: {e}")
+
+
+class BaseKeyModelPipeline:
+    """
+    کلاس پایه مدیریت ۳ کلید [KEY_1, KEY_2, KEY_3] و اولویت مدل‌ها
+    """
+
+    def __init__(
+        self,
+        pipeline_name: str,
+        models: Sequence[str],
+        api_keys: Sequence[str],
+        start_from_first_priority: bool = True,
+        client_factory: Optional[Callable[[str], Any]] = None,
+        state_callback: Optional[Callable[[PipelineExecutionState], None]] = None,
+    ) -> None:
+        cleaned_keys = [k.strip() for k in api_keys if k and k.strip()]
+        if not cleaned_keys:
+            cleaned_keys = ["UNCONFIGURED_KEY"]
+        while len(cleaned_keys) < 3:
+            cleaned_keys.append(cleaned_keys[0])
+
+        self.pipeline_name = pipeline_name
+        self.models: List[str] = list(models)
+        self.api_keys: List[str] = cleaned_keys[:3]
+        self.key_labels: List[str] = [f"KEY_{i + 1}" for i in range(len(self.api_keys))]
+        self.start_from_first_priority = start_from_first_priority
+        self._client_factory = client_factory
+        self._state_callback = state_callback
+        self._clients_cache: Dict[str, Any] = {}
+        self.state = PipelineExecutionState(pipeline_name=pipeline_name)
+
+    def _get_client_for_key(self, api_key: str) -> Any:
+        if api_key not in self._clients_cache:
+            if self._client_factory is not None:
+                self._clients_cache[api_key] = self._client_factory(api_key)
+            else:
+                self._clients_cache[api_key] = genai.Client(api_key=api_key)
+        return self._clients_cache[api_key]
+
+    def _get_ordered_models(self, preferred_first_model: Optional[str] = None) -> List[str]:
+        target_first = preferred_first_model
+        if not target_first and not self.start_from_first_priority and self.state.last_successful_model:
+            target_first = self.state.last_successful_model
+
+        if target_first and target_first in self.models:
+            idx = self.models.index(target_first)
+            return self.models[idx:] + self.models[:idx]
+        return list(self.models)
+
+    def _record_success(self, model_name: str, key_idx: int) -> None:
+        key_label = self.key_labels[key_idx]
+        self.state.record_success(model_name=model_name, key_index=key_idx, key_label=key_label)
+        if self._state_callback is not None:
+            self._state_callback(self.state)
+
+
+class AudioToTextPipeline(BaseKeyModelPipeline):
+    """
+    ۱. مرحله تبدیل ویس به متن (Audio-to-Text Pipeline):
+    ترتیب اولویت مدل‌ها:
+    - اولویت اول: "gemini-3.5-transcribe" (تخصصی صوت)
+    - اولویت دوم: "gemini-3.5-flash-lite" (فوق‌العاده سریع با سهمیه بالا)
+    - اولویت سوم: "gemini-3.1-flash-lite" (پشتیبان نهایی)
+    """
+
+    def __init__(
+        self,
+        api_keys: Sequence[str],
+        models: Sequence[str] = AUDIO_PIPELINE_MODELS,
+        start_from_first_priority: bool = True,
+        client_factory: Optional[Callable[[str], Any]] = None,
+        state_callback: Optional[Callable[[PipelineExecutionState], None]] = _persist_pipeline_state_to_db,
+    ) -> None:
+        super().__init__(
+            pipeline_name="AudioToTextPipeline",
+            models=models,
+            api_keys=api_keys,
+            start_from_first_priority=start_from_first_priority,
+            client_factory=client_factory,
+            state_callback=state_callback,
+        )
+
+    @staticmethod
+    def is_flash_lite_model(model_name: str) -> bool:
+        return "flash-lite" in model_name.lower()
+
+    @classmethod
+    def build_prompt_for_model(cls, model_name: str) -> str:
+        """
+        برای مدل‌های سری Flash Lite، فایل صوتی حتماً به همراه این پرامپت ارسال می‌شود:
+        "متن این فایل صوتی را دقیق، کلمه به کلمه و بدون هیچ توضیح اضافه پیاده کن."
+        """
+        if cls.is_flash_lite_model(model_name):
+            return FLASH_LITE_TRANSCRIPTION_PROMPT
+        return FLASH_LITE_TRANSCRIPTION_PROMPT
+
+    async def _invoke_transcribe_once(
+        self,
+        client: Any,
+        model_name: str,
+        audio_bytes: bytes,
+        mime_type: str,
+        system_instruction: Optional[str] = None,
+        temperature: float = 0.2,
+    ) -> str:
+        prompt_text = self.build_prompt_for_model(model_name)
+        audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)
+        contents = [audio_part, prompt_text]
+
+        cfg_kwargs: Dict[str, Any] = {"temperature": temperature}
+        if system_instruction and not self.is_flash_lite_model(model_name):
+            cfg_kwargs["system_instruction"] = system_instruction
+        config = types.GenerateContentConfig(**cfg_kwargs)
+
+        response = await client.aio.models.generate_content(
+            model=model_name,
+            contents=contents,
+            config=config,
+        )
+        if response and response.text and response.text.strip():
+            return response.text.strip()
+        raise RuntimeError(f"Empty transcription response from {model_name}")
+
+    async def transcribe(
+        self,
+        audio_bytes: bytes,
+        mime_type: str = "audio/ogg",
+        system_instruction: Optional[str] = None,
+        temperature: float = 0.2,
+        preferred_first_model: Optional[str] = None,
+    ) -> str:
+        if not audio_bytes:
+            raise ValueError("فایل صوتی ورودی خالی است.")
+        if not mime_type or "/" not in mime_type:
+            raise ValueError(f"فرمت فایل صوتی نامعتبر است: {mime_type}")
+
+        ordered_models = self._get_ordered_models(preferred_first_model=preferred_first_model)
+        total_attempts = 0
+        last_429_error: Optional[BaseException] = None
+
+        for model_idx, model_name in enumerate(ordered_models):
+            start_key_idx = 0
+            if (
+                model_idx == 0
+                and not self.start_from_first_priority
+                and self.state.last_successful_model == model_name
+            ):
+                start_key_idx = self.state.last_successful_key_index
+
+            key_indices = list(range(start_key_idx, len(self.api_keys))) + list(range(0, start_key_idx))
+
+            for pos, key_idx in enumerate(key_indices):
+                api_key = self.api_keys[key_idx]
+                key_label = self.key_labels[key_idx]
+                total_attempts += 1
+
+                logger.info(
+                    f"🎙️ [{self.pipeline_name}] تلاش {total_attempts}: ارسال ویس به مدل "
+                    f"'{model_name}' (اولویت {model_idx + 1}/{len(ordered_models)}) با کلید '{key_label}'"
+                )
+
+                try:
+                    client = self._get_client_for_key(api_key)
+                    transcript = await self._invoke_transcribe_once(
+                        client=client,
+                        model_name=model_name,
+                        audio_bytes=audio_bytes,
+                        mime_type=mime_type,
+                        system_instruction=system_instruction,
+                        temperature=temperature,
+                    )
+                    self._record_success(model_name=model_name, key_idx=key_idx)
+                    logger.info(
+                        f"✅ [{self.pipeline_name}] تبدیل ویس به متن موفق | مدل: '{model_name}' | کلید: '{key_label}'"
+                    )
+                    return transcript
+
+                except Exception as exc:
+                    if is_http_429_error(exc):
+                        last_429_error = exc
+                        self.state.total_429_switches += 1
+                        has_next_key = (pos + 1) < len(key_indices)
+                        if has_next_key:
+                            next_key_label = self.key_labels[key_indices[pos + 1]]
+                            logger.warning(
+                                f"⚠️ [{self.pipeline_name}][429 Rate Limit] خطای 429 روی مدل '{model_name}' "
+                                f"با کلید '{key_label}' -> سوییچ فوری و بدون توقف به کلید '{next_key_label}'..."
+                            )
+                            continue
+                        else:
+                            if (model_idx + 1) < len(ordered_models):
+                                next_model = ordered_models[model_idx + 1]
+                                logger.warning(
+                                    f"🔄 [{self.pipeline_name}][Model Fallback] هر ۳ کلید روی مدل '{model_name}' "
+                                    f"خطای 429 دادند -> سوییچ فوری به مدل بعدی '{next_model}' و ریست چرخه از KEY_1!"
+                                )
+                            else:
+                                logger.error(
+                                    f"🚨 [{self.pipeline_name}] تمام کلیدها روی آخرین مدل '{model_name}' خطای 429 دادند!"
+                                )
+                            break
+                    else:
+                        logger.error(
+                            f"❌ [{self.pipeline_name}][Non-429 Error] خطای غیر 429 در مدل '{model_name}' "
+                            f"با کلید '{key_label}': {sanitize_error_message(exc)} -> توقف چرخه تعویض کلید و Raise خطا."
+                        )
+                        raise
+
+        raise AllModelsAndKeysExhaustedError(
+            pipeline_name=self.pipeline_name,
+            attempts=total_attempts,
+            last_error=last_429_error,
+        )
+
+
+class ChatPipeline(BaseKeyModelPipeline):
+    """
+    ۲. مرحله تولید پاسخ متنی چت (Chat Pipeline):
+    ترتیب اولویت مدل‌ها:
+    - اولویت اول: "gemini-3.5-flash-lite" (پاسخ‌دهی آنی و کمترین تاخیر)
+    - اولویت دوم: "gemini-3.1-flash-lite" (جایگزین سریع با سهمیه بالا)
+    - اولویت سوم: "gemini-3.8-flash" (مدل هوشمندتر و قوی‌تر برای پاسخ‌های تحلیلی/طولانی)
+    """
+
+    def __init__(
+        self,
+        api_keys: Sequence[str],
+        models: Sequence[str] = CHAT_PIPELINE_MODELS,
+        start_from_first_priority: bool = True,
+        client_factory: Optional[Callable[[str], Any]] = None,
+        state_callback: Optional[Callable[[PipelineExecutionState], None]] = _persist_pipeline_state_to_db,
+    ) -> None:
+        super().__init__(
+            pipeline_name="ChatPipeline",
+            models=models,
+            api_keys=api_keys,
+            start_from_first_priority=start_from_first_priority,
+            client_factory=client_factory,
+            state_callback=state_callback,
+        )
+
+    async def _invoke_chat_once(
+        self,
+        client: Any,
+        model_name: str,
+        input_text: str,
+        system_instruction: Optional[str] = None,
+        temperature: float = 0.65,
+    ) -> str:
+        cfg_kwargs: Dict[str, Any] = {"temperature": temperature}
+        if system_instruction:
+            cfg_kwargs["system_instruction"] = system_instruction
+        config = types.GenerateContentConfig(**cfg_kwargs)
+
+        response = await client.aio.models.generate_content(
+            model=model_name,
+            contents=input_text,
+            config=config,
+        )
+        if response and response.text and response.text.strip():
+            return response.text.strip()
+        raise RuntimeError(f"Empty chat response from {model_name}")
+
+    async def generate_response(
+        self,
+        input_text: str,
+        system_instruction: Optional[str] = None,
+        temperature: float = 0.65,
+        preferred_first_model: Optional[str] = None,
+    ) -> str:
+        if not input_text or not input_text.strip():
+            raise ValueError("متن ورودی برای تولید پاسخ چت خالی است.")
+
+        ordered_models = self._get_ordered_models(preferred_first_model=preferred_first_model)
+        total_attempts = 0
+        last_429_error: Optional[BaseException] = None
+
+        for model_idx, model_name in enumerate(ordered_models):
+            start_key_idx = 0
+            if (
+                model_idx == 0
+                and not self.start_from_first_priority
+                and self.state.last_successful_model == model_name
+            ):
+                start_key_idx = self.state.last_successful_key_index
+
+            key_indices = list(range(start_key_idx, len(self.api_keys))) + list(range(0, start_key_idx))
+
+            for pos, key_idx in enumerate(key_indices):
+                api_key = self.api_keys[key_idx]
+                key_label = self.key_labels[key_idx]
+                total_attempts += 1
+
+                logger.info(
+                    f"💬 [{self.pipeline_name}] تلاش {total_attempts}: ارسال متن به مدل چت "
+                    f"'{model_name}' (اولویت {model_idx + 1}/{len(ordered_models)}) با کلید '{key_label}'"
+                )
+
+                try:
+                    client = self._get_client_for_key(api_key)
+                    reply_text = await self._invoke_chat_once(
+                        client=client,
+                        model_name=model_name,
+                        input_text=input_text,
+                        system_instruction=system_instruction,
+                        temperature=temperature,
+                    )
+                    self._record_success(model_name=model_name, key_idx=key_idx)
+                    logger.info(
+                        f"✅ [{self.pipeline_name}] تولید پاسخ چت موفق | مدل: '{model_name}' | کلید: '{key_label}'"
+                    )
+                    return reply_text
+
+                except Exception as exc:
+                    if is_http_429_error(exc):
+                        last_429_error = exc
+                        self.state.total_429_switches += 1
+                        has_next_key = (pos + 1) < len(key_indices)
+                        if has_next_key:
+                            next_key_label = self.key_labels[key_indices[pos + 1]]
+                            logger.warning(
+                                f"⚠️ [{self.pipeline_name}][429 Rate Limit] خطای 429 روی مدل چت '{model_name}' "
+                                f"با کلید '{key_label}' -> سوییچ فوری و بدون توقف به کلید '{next_key_label}'..."
+                            )
+                            continue
+                        else:
+                            if (model_idx + 1) < len(ordered_models):
+                                next_model = ordered_models[model_idx + 1]
+                                logger.warning(
+                                    f"🔄 [{self.pipeline_name}][Model Fallback] هر ۳ کلید روی مدل چت '{model_name}' "
+                                    f"خطای 429 دادند -> سوییچ فوری به مدل بعدی '{next_model}' و ریست چرخه از KEY_1!"
+                                )
+                            else:
+                                logger.error(
+                                    f"🚨 [{self.pipeline_name}] تمام کلیدها روی آخرین مدل چت '{model_name}' خطای 429 دادند!"
+                                )
+                            break
+                    else:
+                        logger.error(
+                            f"❌ [{self.pipeline_name}][Non-429 Error] خطای غیر 429 در مدل چت '{model_name}' "
+                            f"با کلید '{key_label}': {sanitize_error_message(exc)} -> توقف چرخه تعویض کلید و Raise خطا."
+                        )
+                        raise
+
+        raise AllModelsAndKeysExhaustedError(
+            pipeline_name=self.pipeline_name,
+            attempts=total_attempts,
+            last_error=last_429_error,
+        )
+
+
+class TwoStageBotPipeline:
+    """هماهنگ‌کننده ماژولار مرحله اول (Audio-to-Text) و مرحله دوم (Chat Response)"""
+
+    def __init__(
+        self,
+        api_keys: Sequence[str],
+        start_from_first_priority: bool = True,
+    ) -> None:
+        self.audio_pipeline = AudioToTextPipeline(
+            api_keys=api_keys,
+            models=AUDIO_PIPELINE_MODELS,
+            start_from_first_priority=start_from_first_priority,
+        )
+        self.chat_pipeline = ChatPipeline(
+            api_keys=api_keys,
+            models=CHAT_PIPELINE_MODELS,
+            start_from_first_priority=start_from_first_priority,
+        )
+
+    async def process_voice_to_chat(
+        self,
+        audio_bytes: bytes,
+        mime_type: str = "audio/ogg",
+        audio_system_instruction: Optional[str] = TRANSCRIPTION_CLEANUP_PROMPT,
+        chat_system_instruction: Optional[str] = HUMAN_TELEGRAM_REPLY_SYSTEM_PROMPT,
+        chat_temperature: float = 0.65,
+    ) -> Tuple[str, str]:
+        """اجرای پیوسته مرحله ۱ (تبدیل ویس به متن) و ارسال خروجی به مرحله ۲ (تولید پاسخ چت)"""
+        transcript = await self.audio_pipeline.transcribe(
+            audio_bytes=audio_bytes,
+            mime_type=mime_type,
+            system_instruction=audio_system_instruction,
+        )
+        raw_reply = await self.chat_pipeline.generate_response(
+            input_text=f"متن پیام یا ویس مخاطب:\n{transcript}",
+            system_instruction=chat_system_instruction,
+            temperature=chat_temperature,
+        )
+        return transcript, strip_ai_punctuation_and_artifacts(raw_reply)
+
+
+# نمونه‌های سراسری پایپ‌لاین دو مرحله‌ای با ۳ کلید [KEY_1, KEY_2, KEY_3]
+BOT_PIPELINE = TwoStageBotPipeline(
+    api_keys=API_KEYS,
+    start_from_first_priority=PIPELINE_START_FROM_FIRST,
+)
+AUDIO_PIPELINE = BOT_PIPELINE.audio_pipeline
+CHAT_PIPELINE = BOT_PIPELINE.chat_pipeline
 
 
 # ==================== مدیریت تنظیمات اختصاصی کاربر (User Settings Store) ====================
@@ -327,11 +939,15 @@ def get_user_model_settings(user_id: int) -> dict:
     row = cursor.fetchone()
     if row:
         settings = dict(row)
+        if settings.get("chat_model") not in CHAT_PIPELINE_MODELS:
+            settings["chat_model"] = CHAT_PIPELINE_MODELS[0]
+        if settings.get("transcribe_model") not in AUDIO_PIPELINE_MODELS:
+            settings["transcribe_model"] = AUDIO_PIPELINE_MODELS[0]
     else:
         settings = {
-            "chat_model": CHAT_MODEL,
-            "thinking_level": "HIGH",
-            "transcribe_model": TRANSCRIBE_MODEL,
+            "chat_model": CHAT_PIPELINE_MODELS[0],
+            "thinking_level": "OFF",
+            "transcribe_model": AUDIO_PIPELINE_MODELS[0],
         }
         cursor.execute(
             """
@@ -373,17 +989,16 @@ def save_record(
     bot_msg_id: Optional[int] = None,
     summary: Optional[str] = None,
     translation: Optional[str] = None,
-    humanized_text: Optional[str] = None,
 ) -> int:
     now = time.time()
     conn = _get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT INTO voice_records (chat_id, voice_msg_id, bot_msg_id, transcript, summary, human_reply, humanized_text, translation, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO voice_records (chat_id, voice_msg_id, bot_msg_id, transcript, summary, human_reply, translation, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (chat_id, msg_id, bot_msg_id, transcript, summary, human_reply, humanized_text, translation, now),
+        (chat_id, msg_id, bot_msg_id, transcript, summary, human_reply, translation, now),
     )
     record_id = int(cursor.lastrowid)
     conn.commit()
@@ -396,23 +1011,11 @@ def save_record(
         "transcript": transcript,
         "summary": summary,
         "human_reply": human_reply,
-        "humanized_text": humanized_text,
         "translation": translation,
         "created_at": now,
     }
     _cache_put(record)
     return record_id
-
-
-def _get_raw_input_text(record: dict) -> str:
-    """
-    استخراج دقیق متن خام اولیه‌ای که کاربر فرستاده است (از فیلد transcript)،
-    تا هرگز به اشتباه پاسخ تولیدشده توسط ربات (human_reply) دوباره انسانی‌سازی نشود.
-    """
-    raw = (record.get("transcript") or "").strip()
-    if raw.startswith("پیام مخاطب:\n") and "\n\nنکات پاسخ:\n" in raw:
-        return raw.split("\n\nنکات پاسخ:\n", 1)[1].strip()
-    return raw
 
 
 def get_record(record_id: int) -> Optional[dict]:
@@ -455,7 +1058,7 @@ def get_record_by_msg_id(chat_id: int, msg_id: int) -> Optional[dict]:
 
 
 def update_record_field(record_id: int, field: str, value: str | int) -> None:
-    if field not in ("summary", "human_reply", "humanized_text", "transcript", "bot_msg_id", "translation"):
+    if field not in ("summary", "human_reply", "transcript", "bot_msg_id", "translation"):
         return
     if record_id in _RAM_RECORDS_BY_ID:
         _RAM_RECORDS_BY_ID[record_id][field] = value
@@ -480,9 +1083,6 @@ def build_voice_action_keyboard(record_id: int, has_reply: bool = False) -> Inli
             InlineKeyboardButton("📝 خلاصه", callback_data=f"sum:{record_id}"),
         ],
         [
-            InlineKeyboardButton("✨ انسانی‌سازی متن اصلی (بدون پاسخ)", callback_data=f"humanize:{record_id}"),
-        ],
-        [
             InlineKeyboardButton("🌐 ترجمه", callback_data=f"trans:{record_id}"),
             InlineKeyboardButton("🔊 ارسال ویس (TTS)", callback_data=f"tts:{record_id}"),
         ],
@@ -499,9 +1099,6 @@ def build_reply_keyboard(record_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("✨ انسانی‌سازی متن اصلی (بدون پاسخ)", callback_data=f"humanize:{record_id}"),
-            ],
-            [
                 InlineKeyboardButton("🔄 مدل دیگر", callback_data=f"regen:{record_id}"),
                 InlineKeyboardButton("📝 خلاصه پیام", callback_data=f"sum:{record_id}"),
             ],
@@ -516,61 +1113,44 @@ def build_reply_keyboard(record_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def build_humanized_keyboard(record_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("🔄 مدل دیگر (انسانی‌سازی مجدد متن خام)", callback_data=f"regen_humanize:{record_id}"),
-            ],
-            [
-                InlineKeyboardButton("💬 جواب دادن به متن اصلی", callback_data=f"reply:{record_id}"),
-                InlineKeyboardButton("📝 خلاصه متن اصلی", callback_data=f"sum:{record_id}"),
-            ],
-            [
-                InlineKeyboardButton("🌐 ترجمه", callback_data=f"trans_hum:{record_id}"),
-                InlineKeyboardButton("🔊 ارسال ویس (TTS)", callback_data=f"tts_hum:{record_id}"),
-            ],
-            [
-                InlineKeyboardButton("⚙️ تنظیمات مدل", callback_data="open_settings"),
-            ],
-        ]
-    )
-
-
 def build_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
     s = get_user_model_settings(user_id)
-    c_model = s.get("chat_model", "gemini-3.8-flash")
-    t_level = s.get("thinking_level", "HIGH")
-    tr_model = s.get("transcribe_model", "gemini-3.5-transcribe")
+    c_model = s.get("chat_model", CHAT_PIPELINE_MODELS[0])
+    tr_model = s.get("transcribe_model", AUDIO_PIPELINE_MODELS[0])
 
-    is_flash_high = (c_model == "gemini-3.8-flash" and t_level == "HIGH")
-    is_flash_turbo = (c_model == "gemini-3.8-flash" and t_level == "OFF")
-    is_pro = (c_model == "gemini-3.1-pro-preview")
-    is_trans_35 = (tr_model == "gemini-3.5-transcribe")
+    is_c_35_lite = c_model == "gemini-3.5-flash-lite"
+    is_c_31_lite = c_model == "gemini-3.1-flash-lite"
+    is_c_38_flash = c_model == "gemini-3.8-flash"
 
     buttons = [
         [
             InlineKeyboardButton(
-                f"{'✅ ' if is_flash_high else ''}⚡ Gemini 3.8 Flash (تفکر عمیق High)",
-                callback_data="set_cfg:chat:flash_high",
+                f"{'✅ ' if is_c_35_lite else ''}⚡ اولویت ۱ چت: gemini-3.5-flash-lite",
+                callback_data="set_cfg:chat:35_lite",
             )
         ],
         [
             InlineKeyboardButton(
-                f"{'✅ ' if is_flash_turbo else ''}🚀 Gemini 3.8 Flash (توربو / بدون تفکر)",
-                callback_data="set_cfg:chat:flash_turbo",
+                f"{'✅ ' if is_c_31_lite else ''}🚀 اولویت ۲ چت: gemini-3.1-flash-lite",
+                callback_data="set_cfg:chat:31_lite",
             )
         ],
         [
             InlineKeyboardButton(
-                f"{'✅ ' if is_pro else ''}🧠 Gemini 3.1 Pro Preview (نهایت استدلال)",
-                callback_data="set_cfg:chat:pro",
+                f"{'✅ ' if is_c_38_flash else ''}🧠 اولویت ۳ چت: gemini-3.8-flash",
+                callback_data="set_cfg:chat:38_flash",
             )
         ],
         [
             InlineKeyboardButton(
-                f"🎙️ مدل ویس: {'3.5 Transcribe' if is_trans_35 else '3.8 Flash'} (تغییر)",
+                f"🎙️ اولویت ۱ ویس: {tr_model} (تغییر چرخه)",
                 callback_data="set_cfg:transcribe:toggle",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"🔑 حالت شروع چرخه: {'اولویت اول (KEY_1)' if AUDIO_PIPELINE.start_from_first_priority else 'آخرین کلید/مدل موفق'}",
+                callback_data="set_cfg:pipeline:toggle_mode",
             )
         ],
         [
@@ -657,7 +1237,7 @@ def _compress_audio_in_memory_sync(raw_bytes: bytes) -> tuple[bytes, str]:
 
 
 async def optimize_media_for_fast_upload(raw_bytes: bytes, mime_type: str, is_video_note: bool) -> tuple[bytes, str]:
-    """اگر فایل ویدیومسیج است یا بیش از ۳۵۰ کیلوبایت حجم دارد، در کسری از ثانیه صدای خالص کم‌حجم استخراج می‌شود"""
+    """اگر فایل ویدیومسیج است یا بیش از ۳۵۰ کیلوبایت حجم دارد، صدای خالص کم‌حجم استخراج می‌شود"""
     if not is_video_note and len(raw_bytes) <= FFMPEG_COMPRESS_THRESHOLD_BYTES and mime_type == "audio/ogg":
         return raw_bytes, mime_type
 
@@ -667,170 +1247,9 @@ async def optimize_media_for_fast_upload(raw_bytes: bytes, mime_type: str, is_vi
     return raw_bytes, mime_type
 
 
-# ==================== موتور هوش مصنوعی پیشرفته (Gemini 3.x Series) ====================
-_genai_client: Optional[genai.Client] = None
-
-
+# ==================== توابع اتصال به پایپ‌لاین دو مرحله‌ای ====================
 def get_genai_client() -> genai.Client:
-    global _genai_client
-    if _genai_client is None:
-        if not GEMINI_API_KEY:
-            raise RuntimeError("کلید GEMINI_API_KEY تنظیم نشده است.")
-        _genai_client = genai.Client(api_key=GEMINI_API_KEY)
-    return _genai_client
-
-
-def _candidate_models(primary_model: str) -> list[str]:
-    models = []
-    for m in (primary_model, *FAST_MODELS):
-        if m and m not in models:
-            models.append(m)
-    return models
-
-
-def _build_model_config(
-    model_name: str,
-    system_instruction: Optional[str] = None,
-    temperature: float = 0.5,
-    thinking_level: Optional[str] = "HIGH",
-    response_modalities: Optional[list[str]] = None,
-) -> types.GenerateContentConfig:
-    kwargs: dict = {"temperature": temperature}
-    if system_instruction:
-        kwargs["system_instruction"] = system_instruction
-    if response_modalities:
-        kwargs["response_modalities"] = response_modalities
-
-    if hasattr(types, "ThinkingConfig"):
-        try:
-            if thinking_level == "OFF":
-                kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
-            elif thinking_level in ("HIGH", "MEDIUM", "LOW"):
-                kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
-            elif "2.5" in model_name:
-                kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
-        except Exception as e:
-            logger.debug(f"ThinkingConfig setup note: {e}")
-
-    return types.GenerateContentConfig(**kwargs)
-
-
-async def _call_single_model(
-    model_name: str,
-    contents: list | str,
-    system_instruction: Optional[str] = None,
-    temperature: float = 0.5,
-    thinking_level: Optional[str] = "HIGH",
-    response_modalities: Optional[list[str]] = None,
-) -> Any:
-    client = get_genai_client()
-    config = _build_model_config(
-        model_name=model_name,
-        system_instruction=system_instruction,
-        temperature=temperature,
-        thinking_level=thinking_level,
-        response_modalities=response_modalities,
-    )
-    response = await client.aio.models.generate_content(
-        model=model_name,
-        contents=contents,
-        config=config,
-    )
-    if response_modalities and "AUDIO" in response_modalities:
-        if response and response.candidates and response.candidates[0].content:
-            for part in response.candidates[0].content.parts:
-                if part.inline_data and part.inline_data.data:
-                    return part.inline_data.data
-        raise RuntimeError(f"No audio returned from {model_name}")
-
-    if response and response.text and response.text.strip():
-        return response.text.strip()
-    raise RuntimeError(f"Empty response from {model_name}")
-
-
-async def _hedged_generate(
-    primary_model: str,
-    contents: list | str,
-    system_instruction: Optional[str] = None,
-    temperature: float = 0.5,
-    hedge_delay_sec: float = 3.2,
-    thinking_level: Optional[str] = "HIGH",
-) -> str:
-    """
-    مکانیزم مسابقه موازی و فال‌بک خودکار (Hedged Racing):
-    مدل اصلی شروع می‌شود؛ در صورت تأخیر یا خطای کوئتا، مدل‌های سریع و رزرو سریعاً جایگزین می‌شوند.
-    """
-    candidates = _candidate_models(primary_model)
-    first_model = candidates[0]
-    backup_models = candidates[1:]
-
-    primary_task = asyncio.create_task(
-        _call_single_model(
-            first_model,
-            contents,
-            system_instruction,
-            temperature,
-            thinking_level=thinking_level,
-        )
-    )
-
-    try:
-        done, _ = await asyncio.wait({primary_task}, timeout=hedge_delay_sec)
-        if primary_task in done:
-            return primary_task.result()
-    except Exception as first_err:
-        logger.warning(f"Primary model {first_model} fail/exhausted: {sanitize_error_message(first_err)}")
-        for b_model in backup_models:
-            try:
-                return await _call_single_model(
-                    b_model,
-                    contents,
-                    system_instruction,
-                    temperature,
-                    thinking_level=thinking_level,
-                )
-            except Exception as b_err:
-                logger.warning(f"Backup model {b_model} failed: {sanitize_error_message(b_err)}")
-        raise
-
-    if backup_models:
-        second_model = backup_models[0]
-        hedge_task = asyncio.create_task(
-            _call_single_model(
-                second_model,
-                contents,
-                system_instruction,
-                temperature,
-                thinking_level=thinking_level,
-            )
-        )
-        tasks = {primary_task, hedge_task}
-        while tasks:
-            done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for finished in done:
-                try:
-                    result = finished.result()
-                    for remaining in tasks:
-                        remaining.cancel()
-                    return result
-                except Exception as err:
-                    logger.warning(f"Raced model failed: {sanitize_error_message(err)}")
-
-        for b_model in backup_models[1:]:
-            try:
-                return await _call_single_model(
-                    b_model,
-                    contents,
-                    system_instruction,
-                    temperature,
-                    thinking_level=thinking_level,
-                )
-            except Exception as err:
-                logger.warning(f"Fallback model {b_model} failed: {sanitize_error_message(err)}")
-    else:
-        return await primary_task
-
-    raise RuntimeError("خطا در دریافت پاسخ سریع از سرور هوش مصنوعی.")
+    return AUDIO_PIPELINE._get_client_for_key(KEY_1)
 
 
 def _convert_wav_to_ogg_opus_sync(wav_bytes: bytes) -> bytes:
@@ -865,15 +1284,40 @@ def _convert_wav_to_ogg_opus_sync(wav_bytes: bytes) -> bytes:
 
 
 async def generate_speech_audio(text: str) -> bytes:
-    """تولید ویس صوتی فوق‌العاده طبیعی با مدل اختصاصی Gemini 3.8 Flash TTS"""
+    """تولید ویس صوتی طبیعی با چرخش ۳ کلید [KEY_1, KEY_2, KEY_3] در صورت بروز خطای 429"""
     clean_text = text.replace("*", "").replace("#", "").strip()[:800]
-    raw_wav_bytes = await _call_single_model(
-        model_name=TTS_MODEL,
-        contents=clean_text,
-        response_modalities=["AUDIO"],
-    )
-    ogg_bytes = await asyncio.to_thread(_convert_wav_to_ogg_opus_sync, raw_wav_bytes)
-    return ogg_bytes
+    last_429: Optional[BaseException] = None
+
+    for key_idx, api_key in enumerate(API_KEYS):
+        key_label = f"KEY_{key_idx + 1}"
+        try:
+            client = AUDIO_PIPELINE._get_client_for_key(api_key)
+            config = types.GenerateContentConfig(
+                temperature=0.4,
+                response_modalities=["AUDIO"],
+            )
+            response = await client.aio.models.generate_content(
+                model=TTS_MODEL,
+                contents=clean_text,
+                config=config,
+            )
+            if response and response.candidates and response.candidates[0].content:
+                for part in response.candidates[0].content.parts:
+                    if part.inline_data and part.inline_data.data:
+                        raw_wav_bytes = part.inline_data.data
+                        return await asyncio.to_thread(_convert_wav_to_ogg_opus_sync, raw_wav_bytes)
+            raise RuntimeError(f"No audio returned from {TTS_MODEL}")
+        except Exception as exc:
+            if is_http_429_error(exc):
+                last_429 = exc
+                logger.warning(
+                    f"⚠️ [TTS][429 Rate Limit] خطای 429 با کلید '{key_label}' -> سوییچ فوری به کلید بعدی..."
+                )
+                continue
+            logger.error(f"❌ [TTS][Non-429 Error] با کلید '{key_label}': {sanitize_error_message(exc)}")
+            raise
+
+    raise AllModelsAndKeysExhaustedError("TTSPipeline", attempts=len(API_KEYS), last_error=last_429)
 
 
 async def transcribe_audio_bytes(
@@ -881,30 +1325,20 @@ async def transcribe_audio_bytes(
     mime_type: str = "audio/ogg",
     preferred_model: Optional[str] = None,
 ) -> str:
-    audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)
-    model_to_use = preferred_model or TRANSCRIBE_MODEL
-    return await _hedged_generate(
-        primary_model=model_to_use,
-        contents=[audio_part, "متن این ویس را دقیق بنویس:"],
+    """
+    وظیفه اول: تبدیل فایل صوتی (ویس) به متن از طریق AudioToTextPipeline
+    با اولویت:
+    1. gemini-3.5-transcribe
+    2. gemini-3.5-flash-lite (همراه با پرامپت کلمه به کلمه)
+    3. gemini-3.1-flash-lite (همراه با پرامپت کلمه به کلمه)
+    """
+    pref = preferred_model if preferred_model in AUDIO_PIPELINE_MODELS else None
+    return await AUDIO_PIPELINE.transcribe(
+        audio_bytes=audio_bytes,
+        mime_type=mime_type,
         system_instruction=TRANSCRIPTION_CLEANUP_PROMPT,
         temperature=0.2,
-        hedge_delay_sec=3.8,
-        thinking_level="OFF",
-    )
-
-
-async def generate_summary_text(transcript: str, user_id: Optional[int] = None) -> str:
-    settings = get_user_model_settings(user_id) if user_id else {}
-    model_to_use = settings.get("chat_model") or CHAT_MODEL
-    thinking_level = settings.get("thinking_level") or "HIGH"
-
-    return await _hedged_generate(
-        primary_model=model_to_use,
-        contents=f"متن ورودی:\n{transcript}",
-        system_instruction=SUMMARY_SYSTEM_PROMPT,
-        temperature=0.4,
-        hedge_delay_sec=2.8,
-        thinking_level=thinking_level,
+        preferred_first_model=pref,
     )
 
 
@@ -913,74 +1347,62 @@ async def generate_human_telegram_reply(
     variation_hint: str = "",
     user_id: Optional[int] = None,
 ) -> str:
+    """
+    وظیفه دوم: تولید پاسخ متنی چت بر اساس متن دریافتی از طریق ChatPipeline
+    با اولویت:
+    1. gemini-3.5-flash-lite
+    2. gemini-3.1-flash-lite
+    3. gemini-3.8-flash
+    """
     settings = get_user_model_settings(user_id) if user_id else {}
-    model_to_use = settings.get("chat_model") or CHAT_MODEL
-    thinking_level = settings.get("thinking_level") or "HIGH"
+    pref_model = settings.get("chat_model")
+    if pref_model not in CHAT_PIPELINE_MODELS:
+        pref_model = None
 
     user_content = f"متن پیام یا ویس مخاطب:\n{transcript}"
     if variation_hint:
         user_content += f"\n\nدستورالعمل تکمیلی:\n{variation_hint}"
 
-    raw_reply = await _hedged_generate(
-        primary_model=model_to_use,
-        contents=user_content,
+    raw_reply = await CHAT_PIPELINE.generate_response(
+        input_text=user_content,
         system_instruction=HUMAN_TELEGRAM_REPLY_SYSTEM_PROMPT,
         temperature=0.65,
-        hedge_delay_sec=2.8,
-        thinking_level=thinking_level,
+        preferred_first_model=pref_model,
     )
     return strip_ai_punctuation_and_artifacts(raw_reply)
 
 
-async def generate_humanized_raw_text(
-    raw_text: str,
-    variation_hint: str = "",
-    user_id: Optional[int] = None,
-) -> str:
-    """
-    انسانی‌سازی مستقیم خودِ متن خام ورودی (بدون پاسخ دادن به آن)
-    مناسب برای مواقعی که کاربر متنی از هوش مصنوعی گرفته و می‌خواهد خودِ همان متن را انسانیزه کند.
-    """
+async def generate_summary_text(transcript: str, user_id: Optional[int] = None) -> str:
+    """تولید خلاصه پیام از طریق ChatPipeline با ساختار Fallback و مدیریت خطای 429"""
     settings = get_user_model_settings(user_id) if user_id else {}
-    model_to_use = settings.get("chat_model") or CHAT_MODEL
-    thinking_level = settings.get("thinking_level") or "HIGH"
+    pref_model = settings.get("chat_model")
+    if pref_model not in CHAT_PIPELINE_MODELS:
+        pref_model = None
 
-    user_content = (
-        "متن خام زیر را بدون اینکه به آن پاسخ بدهی، با حفظ کامل محتوا و نکاتش "
-        "به لحن طبیعی و انسانی تلگرامی (طبق قوانین سیستم) بازنویسی و انسانی‌سازی کن:\n\n"
-        f"{raw_text}"
+    return await CHAT_PIPELINE.generate_response(
+        input_text=f"متن ورودی:\n{transcript}",
+        system_instruction=SUMMARY_SYSTEM_PROMPT,
+        temperature=0.4,
+        preferred_first_model=pref_model,
     )
-    if variation_hint:
-        user_content += f"\n\nدستورالعمل تکمیلی:\n{variation_hint}"
-
-    raw_humanized = await _hedged_generate(
-        primary_model=model_to_use,
-        contents=user_content,
-        system_instruction=HUMANIZE_RAW_TEXT_SYSTEM_PROMPT,
-        temperature=0.6,
-        hedge_delay_sec=2.8,
-        thinking_level=thinking_level,
-    )
-    return strip_ai_punctuation_and_artifacts(raw_humanized)
 
 
 async def translate_text_content(text: str, user_id: Optional[int] = None) -> str:
-    """ترجمه روان و اصیل با هوش مصنوعی (فارسی به انگلیسی و برعکس)"""
+    """ترجمه روان و اصیل از طریق ChatPipeline با ساختار Fallback و مدیریت خطای 429"""
     settings = get_user_model_settings(user_id) if user_id else {}
-    model_to_use = settings.get("chat_model") or CHAT_MODEL
-    thinking_level = settings.get("thinking_level") or "HIGH"
+    pref_model = settings.get("chat_model")
+    if pref_model not in CHAT_PIPELINE_MODELS:
+        pref_model = None
 
-    return await _hedged_generate(
-        primary_model=model_to_use,
-        contents=f"متن زیر را ترجمه کن:\n{text}",
+    return await CHAT_PIPELINE.generate_response(
+        input_text=f"متن زیر را ترجمه کن:\n{text}",
         system_instruction=TRANSLATION_SYSTEM_PROMPT,
         temperature=0.3,
-        hedge_delay_sec=2.8,
-        thinking_level=thinking_level,
+        preferred_first_model=pref_model,
     )
 
 
-# ==================== پیش‌تولید هوشمند در پس‌زمینه (Speculative Background Pre-Generation) ====================
+# ==================== پیش‌تولید هوشمند مرحله دوم در پس‌زمینه ====================
 async def _precompute_reply_for_record(record_id: int, transcript: str, user_id: Optional[int] = None) -> str:
     try:
         reply = await generate_human_telegram_reply(transcript, user_id=user_id)
@@ -999,28 +1421,14 @@ async def _precompute_summary_for_record(record_id: int, transcript: str, user_i
         _INFLIGHT_SUMMARY_TASKS.pop(record_id, None)
 
 
-async def _precompute_humanize_for_record(record_id: int, raw_text: str, user_id: Optional[int] = None) -> str:
-    try:
-        humanized = await generate_humanized_raw_text(raw_text, user_id=user_id)
-        update_record_field(record_id, "humanized_text", humanized)
-        return humanized
-    finally:
-        _INFLIGHT_HUMANIZE_TASKS.pop(record_id, None)
-
-
 def trigger_background_precomputation(record_id: int, transcript: str, user_id: Optional[int] = None) -> None:
-    """تولید خودکار جواب انسانی و خلاصه در پس‌زمینه به محض آماده شدن متن ویس تا دکمه‌ها در ۰.۰۵ ثانیه کار کنند"""
+    """
+    بلافاصله پس از اتمام مرحله اول (تبدیل ویس به متن)، متن استخراج‌شده به عنوان ورودی
+    به مرحله دوم (ChatPipeline) داده می‌شود تا پاسخ متنی چت آماده گردد.
+    """
     if record_id not in _INFLIGHT_REPLY_TASKS:
         _INFLIGHT_REPLY_TASKS[record_id] = asyncio.create_task(
             _precompute_reply_for_record(record_id, transcript, user_id=user_id)
-        )
-    if record_id not in _INFLIGHT_SUMMARY_TASKS:
-        _INFLIGHT_SUMMARY_TASKS[record_id] = asyncio.create_task(
-            _precompute_summary_for_record(record_id, transcript, user_id=user_id)
-        )
-    if record_id not in _INFLIGHT_HUMANIZE_TASKS:
-        _INFLIGHT_HUMANIZE_TASKS[record_id] = asyncio.create_task(
-            _precompute_humanize_for_record(record_id, transcript, user_id=user_id)
         )
 
 
@@ -1030,14 +1438,19 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     welcome_text = (
-        "سلام 👋 به ربات هوشمند با موتور نسل جدید Gemini خوش آمدید!\n\n"
-        "🚀 **امکانات قدرتمند ربات:**\n"
-        "۱. **🎙️ رونویسی فوق‌دقیق ویس:** با مدل تخصصی `Gemini 3.5 Transcribe` با دقت خارق‌العاده در درک لحن محاوره‌ای و کلمات تخصصی.\n"
-        "۲. **💬 پاسخ انسانی و خونسرد:** با مدل `Gemini 3.8 Flash (High Thinking)` یا `Gemini 3.1 Pro` بدون علائم نگارشی و تملق.\n"
-        "۳. **🌐 ترجمه هوشمند:** ترجمه بلادرنگ و روان بین فارسی و انگلیسی با پرامپت اختصاصی.\n"
-        "۴. **🔊 تبدیل متن به ویس (TTS):** تولید پیام صوتی طبیعی با مدل پرچمدار `Gemini 3.8 Flash TTS`.\n"
-        "۵. **⚙️ انتخاب و تنظیم مدل:** با دستور `/settings` یا `/model` می‌توانید در هر لحظه مدل یا سطح تفکر را تغییر دهید.\n\n"
-        "💡 **روش استفاده:** کافیست یک ویس، آهنگ یا پیام متنی بفرستید تا فوراً پردازش شود."
+        "سلام 👋 به ربات هوشمند با معماری **Pipeline دو مرحله‌ای** خوش آمدید!\n\n"
+        "🚀 **معماری Fallback هوشمند (۳ کلید مجزا + مدیریت خطای 429):**\n"
+        "۱. **🎙️ مرحله اول (تبدیل ویس به متن):**\n"
+        "   • اولویت اول: `gemini-3.5-transcribe`\n"
+        "   • اولویت دوم: `gemini-3.5-flash-lite`\n"
+        "   • اولویت سوم: `gemini-3.1-flash-lite`\n"
+        "۲. **💬 مرحله دوم (تولید پاسخ چت):**\n"
+        "   • اولویت اول: `gemini-3.5-flash-lite`\n"
+        "   • اولویت دوم: `gemini-3.1-flash-lite`\n"
+        "   • اولویت سوم: `gemini-3.8-flash`\n"
+        "۳. **🌐 ترجمه و 🔊 تبدیل متن به ویس (TTS):** همراه با چرخش خودکار کلیدهای سه‌گانه.\n"
+        "۴. **⚙️ مشاهده وضعیت کلیدها و مدل‌ها:** با دستور `/settings` یا `/model`.\n\n"
+        "💡 **روش استفاده:** کافیست یک ویس، فایل صوتی یا پیام متنی بفرستید تا فوراً پردازش شود."
     )
     if update.message:
         await update.message.reply_text(welcome_text, parse_mode="Markdown")
@@ -1086,7 +1499,6 @@ async def process_single_voice(update: Update, context: ContextTypes.DEFAULT_TYP
     is_video_note = message.video_note is not None
     mime_type = "video/mp4" if is_video_note else (getattr(media_obj, "mime_type", None) or "audio/ogg")
 
-    # اجرای موازی ارسال پیام وضعیت تلگرام و دانلود فایل صوتی در یک لحظه (حذف تأخیر سریالی)
     status_msg_task = asyncio.create_task(
         message.reply_text(
             "⚡ در حال تبدیل فوق‌سریع ویس...",
@@ -1106,13 +1518,13 @@ async def process_single_voice(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
         user_cfg = get_user_model_settings(user.id)
+        # اجرای مرحله اول (Audio-to-Text Pipeline)
         transcript = await transcribe_audio_bytes(
             opt_bytes,
             mime_type=opt_mime,
             preferred_model=user_cfg.get("transcribe_model"),
         )
 
-        # ذخیره سریع و دریافت record_id
         record_id = save_record(
             chat_id=message.chat_id,
             msg_id=message.message_id,
@@ -1120,7 +1532,7 @@ async def process_single_voice(update: Update, context: ContextTypes.DEFAULT_TYP
             transcript=transcript,
         )
 
-        # استارت پیش‌تولید جواب انسانی و خلاصه در پس‌زمینه برای پاسخ آنی به کلیک دکمه‌ها
+        # ارسال خروجی مرحله اول به مرحله دوم (Chat Pipeline) در پس‌زمینه
         trigger_background_precomputation(record_id, transcript, user_id=user.id)
 
         await safe_edit_or_send_long_text(
@@ -1192,7 +1604,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"کاربر می‌خواهد در جوابِ این پیام/ویس، این نکات یا تصمیم‌ها را بگوید: «{incoming_text}». "
                 f"دقیقاً همین موارد را با لحن طبیعی، خونسرد، بدون تملق و بدون هیچ علامت نگارشی و نیم‌فاصله کتابی تبدیل به پیام تلگرامی کن."
             )
-            # اجرای موازی ارسال پیام انتظار و تولید پاسخ هوش مصنوعی در یک لحظه!
             wait_msg_task = asyncio.create_task(
                 message.reply_text(
                     "⚡ در حال نوشتن جواب تلگرامی...",
@@ -1223,7 +1634,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await wait_msg.edit_text(f"❌ خطا: {sanitize_error_message(e)}")
                 return
 
-    # حالت ۲: پیام متنی فورواردشده یا مستقیم -> اجرای موازی پیام وضعیت و تولید پاسخ
+    # حالت ۲: پیام متنی فورواردشده یا مستقیم -> مرحله دوم (Chat Pipeline)
     wait_msg_task = asyncio.create_task(
         message.reply_text(
             "⚡ در حال نوشتن جواب انسانی...",
@@ -1242,10 +1653,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             transcript=incoming_text,
             human_reply=human_reply,
         )
-        if record_id not in _INFLIGHT_HUMANIZE_TASKS:
-            _INFLIGHT_HUMANIZE_TASKS[record_id] = asyncio.create_task(
-                _precompute_humanize_for_record(record_id, incoming_text, user_id=user.id)
-            )
         await safe_edit_or_send_long_text(
             status_msg=wait_msg,
             origin_msg=message,
@@ -1257,6 +1664,27 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await wait_msg.edit_text(f"❌ خطا در تولید پاسخ: {sanitize_error_message(e)}")
 
 
+def _build_settings_status_text(user_id: int) -> str:
+    s = get_user_model_settings(user_id)
+    a_state = AUDIO_PIPELINE.state
+    c_state = CHAT_PIPELINE.state
+    a_last = f"{a_state.last_successful_model or 'اجرا نشده'} ({a_state.last_successful_key_label})"
+    c_last = f"{c_state.last_successful_model or 'اجرا نشده'} ({c_state.last_successful_key_label})"
+
+    return (
+        "⚙️ **تنظیمات و وضعیت پایپ‌لاین دو مرحله‌ای (۳ کلید مجزا)**\n\n"
+        f"🎙️ **مرحله ۱ (ویس به متن):**\n"
+        f"   • اولویت مدل‌ها: `{' -> '.join(AUDIO_PIPELINE_MODELS)}`\n"
+        f"   • مدل شروع فعلی: `{s.get('transcribe_model')}`\n"
+        f"   • آخرین اجرای موفق: `{a_last}` (تغییر کلید 429: `{a_state.total_429_switches}`)\n\n"
+        f"💬 **مرحله ۲ (پاسخ چت):**\n"
+        f"   • اولویت مدل‌ها: `{' -> '.join(CHAT_PIPELINE_MODELS)}`\n"
+        f"   • مدل شروع فعلی: `{s.get('chat_model')}`\n"
+        f"   • آخرین اجرای موفق: `{c_last}` (تغییر کلید 429: `{c_state.total_429_switches}`)\n\n"
+        "برای تغییر اولویت شروع یا حالت چرخه کلیدها کلیک کنید:"
+    )
+
+
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_user_authorized(update):
         return
@@ -1264,17 +1692,8 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not user or not update.message:
         return
 
-    s = get_user_model_settings(user.id)
-    text = (
-        "⚙️ **تنظیمات موتورهای پیشرفته هوش مصنوعی Gemini**\n\n"
-        f"🔹 **مدل فعال چت/پاسخ:** `{s.get('chat_model')}`\n"
-        f"🔹 **سطح تفکر (Thinking Level):** `{s.get('thinking_level')}`\n"
-        f"🔹 **مدل تبدیل ویس (Speech-to-Text):** `{s.get('transcribe_model')}`\n"
-        f"🔹 **مدل تولید ویس (TTS):** `{TTS_MODEL}`\n\n"
-        "برای تغییر مدل یا سرعت تفکر، روی دکمه‌های زیر کلیک کنید:"
-    )
     await update.message.reply_text(
-        text,
+        _build_settings_status_text(user.id),
         reply_markup=build_settings_keyboard(user.id),
         parse_mode="Markdown",
     )
@@ -1291,19 +1710,9 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     if not query or not query.data or not query.message or not user:
         return
 
-    # ۱. مدیریت پنجره تنظیمات هوش مصنوعی
     if query.data == "open_settings":
-        s = get_user_model_settings(user.id)
-        text = (
-            "⚙️ **تنظیمات موتورهای هوش مصنوعی**\n\n"
-            f"🔹 **مدل فعال چت/پاسخ:** `{s.get('chat_model')}`\n"
-            f"🔹 **سطح تفکر (Thinking Level):** `{s.get('thinking_level')}`\n"
-            f"🔹 **مدل تبدیل ویس:** `{s.get('transcribe_model')}`\n"
-            f"🔹 **مدل صدا (TTS):** `{TTS_MODEL}`\n\n"
-            "روی هر گزینه برای تغییر وضعیت بزنید:"
-        )
         await query.message.reply_text(
-            text,
+            _build_settings_status_text(user.id),
             reply_markup=build_settings_keyboard(user.id),
             parse_mode="Markdown",
         )
@@ -1321,36 +1730,33 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     if query.data.startswith("set_cfg:"):
         _, target, mode = query.data.split(":", 2)
         if target == "chat":
-            if mode == "flash_high":
+            if mode == "35_lite":
+                update_user_setting(user.id, "chat_model", "gemini-3.5-flash-lite")
+                await query.answer("⚡ اولویت اول چت: gemini-3.5-flash-lite فعال شد!", show_alert=False)
+            elif mode == "31_lite":
+                update_user_setting(user.id, "chat_model", "gemini-3.1-flash-lite")
+                await query.answer("🚀 اولویت چت: gemini-3.1-flash-lite فعال شد!", show_alert=False)
+            elif mode == "38_flash":
                 update_user_setting(user.id, "chat_model", "gemini-3.8-flash")
-                update_user_setting(user.id, "thinking_level", "HIGH")
-                await query.answer("✅ Gemini 3.8 Flash (تفکر عمیق High) انتخاب شد!", show_alert=False)
-            elif mode == "flash_turbo":
-                update_user_setting(user.id, "chat_model", "gemini-3.8-flash")
-                update_user_setting(user.id, "thinking_level", "OFF")
-                await query.answer("🚀 Gemini 3.8 Flash (توربو بدون تفکر) انتخاب شد!", show_alert=False)
-            elif mode == "pro":
-                update_user_setting(user.id, "chat_model", "gemini-3.1-pro-preview")
-                update_user_setting(user.id, "thinking_level", "HIGH")
-                await query.answer("🧠 Gemini 3.1 Pro Preview (نهایت استدلال) انتخاب شد!", show_alert=False)
+                await query.answer("🧠 اولویت چت: gemini-3.8-flash فعال شد!", show_alert=False)
         elif target == "transcribe" and mode == "toggle":
-            curr = get_user_model_settings(user.id).get("transcribe_model")
-            new_m = "gemini-3.8-flash" if curr == "gemini-3.5-transcribe" else "gemini-3.5-transcribe"
+            curr = get_user_model_settings(user.id).get("transcribe_model", AUDIO_PIPELINE_MODELS[0])
+            idx = AUDIO_PIPELINE_MODELS.index(curr) if curr in AUDIO_PIPELINE_MODELS else 0
+            new_m = AUDIO_PIPELINE_MODELS[(idx + 1) % len(AUDIO_PIPELINE_MODELS)]
             update_user_setting(user.id, "transcribe_model", new_m)
-            await query.answer(f"🎙️ مدل ویس تغییر کرد به:\n{new_m}", show_alert=False)
+            await query.answer(f"🎙️ مدل اولویت ویس تغییر کرد به:\n{new_m}", show_alert=False)
+        elif target == "pipeline" and mode == "toggle_mode":
+            new_flag = not AUDIO_PIPELINE.start_from_first_priority
+            AUDIO_PIPELINE.start_from_first_priority = new_flag
+            CHAT_PIPELINE.start_from_first_priority = new_flag
+            await query.answer(
+                "✅ شروع از اولویت اول (KEY_1) فعال شد" if new_flag else "✅ ادامه از آخرین کلید/مدل موفق فعال شد",
+                show_alert=False,
+            )
 
-        s = get_user_model_settings(user.id)
-        updated_text = (
-            "⚙️ **تنظیمات موتورهای هوش مصنوعی**\n\n"
-            f"🔹 **مدل فعال چت/پاسخ:** `{s.get('chat_model')}`\n"
-            f"🔹 **سطح تفکر (Thinking Level):** `{s.get('thinking_level')}`\n"
-            f"🔹 **مدل تبدیل ویس:** `{s.get('transcribe_model')}`\n"
-            f"🔹 **مدل صدا (TTS):** `{TTS_MODEL}`\n\n"
-            "روی هر گزینه برای تغییر وضعیت بزنید:"
-        )
         try:
             await query.message.edit_text(
-                updated_text,
+                _build_settings_status_text(user.id),
                 reply_markup=build_settings_keyboard(user.id),
                 parse_mode="Markdown",
             )
@@ -1476,10 +1882,10 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 
     elif action == "tts":
         text_to_speak = record.get("human_reply") or transcript
-        await query.answer("🔊 در حال تولید ویس صوتی با Gemini 3.8 Flash TTS...")
+        await query.answer("🔊 در حال تولید ویس صوتی...")
         wait_msg_task = asyncio.create_task(
             query.message.reply_text(
-                "🔊 در حال تولید فایل صوتی با مدل Gemini 3.8 Flash TTS...",
+                "🔊 در حال تولید فایل صوتی با مدل Gemini TTS...",
                 reply_to_message_id=voice_msg_id,
             )
         )
@@ -1490,7 +1896,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             await query.message.reply_voice(
                 voice=io.BytesIO(ogg_bytes),
                 reply_to_message_id=voice_msg_id,
-                caption="🔊 ویس تولیدشده با مدل پرچمدار Gemini 3.8 Flash TTS",
+                caption="🔊 ویس تولیدشده با Gemini TTS",
             )
             await wait_msg.delete()
         except Exception as e:
@@ -1526,131 +1932,24 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         except Exception as e:
             await wait_msg.edit_text(f"❌ خطا در تولید جواب انسانی: {sanitize_error_message(e)}")
 
-    elif action == "humanize":
-        raw_source_text = _get_raw_input_text(record)
-        if record.get("humanized_text"):
-            await query.answer("⚡ متن انسانی‌شده آماده است!")
-            await query.message.reply_text(
-                record["humanized_text"][:3950],
-                reply_to_message_id=voice_msg_id,
-                reply_markup=build_humanized_keyboard(record_id),
-            )
-            return
-
-        await query.answer("⚡ در حال انسانی‌سازی متن اصلی...")
-        wait_msg_task = asyncio.create_task(
-            query.message.reply_text(
-                "⚡ در حال انسانی‌سازی متن اصلی (بدون پاسخ دادن)...",
-                reply_to_message_id=voice_msg_id,
-            )
-        )
-        inflight = _INFLIGHT_HUMANIZE_TASKS.get(record_id)
-        humanize_task = inflight if inflight else asyncio.create_task(
-            _precompute_humanize_for_record(record_id, raw_source_text, user_id=user.id)
-        )
-        wait_msg = await wait_msg_task
-        try:
-            humanized_text = await humanize_task
-            await safe_edit_or_send_long_text(
-                status_msg=wait_msg,
-                origin_msg=query.message,
-                full_text=humanized_text,
-                reply_markup=build_humanized_keyboard(record_id),
-            )
-        except Exception as e:
-            await wait_msg.edit_text(f"❌ خطا در انسانی‌سازی متن اصلی: {sanitize_error_message(e)}")
-
-    elif action == "regen_humanize":
-        raw_source_text = _get_raw_input_text(record)
-        await query.answer("🔄 در حال بازنویسی و انسانی‌سازی مجدد متن خام...")
-        hint = (
-            "یک مدل بازنویسی متفاوت‌تر، روان‌تر و طبیعی‌تر از همین متن خام ورودی ارائه بده "
-            "به طوری که به هیچ وجه به متن جواب ندی بلکه خودِ همین متن خام رو با لحن خونسرد تلگرامی، "
-            "بدون هیچ علامت نگارشی، بدون نیم‌فاصله کتابی و بدون تعارف انسانی‌سازی کنی."
-        )
-        wait_msg_task = asyncio.create_task(
-            query.message.reply_text(
-                "⚡ در حال انسانی‌سازی مجدد متن اصلی با مدل جدید...",
-                reply_to_message_id=voice_msg_id,
-            )
-        )
-        humanize_task = asyncio.create_task(
-            generate_humanized_raw_text(raw_source_text, variation_hint=hint, user_id=user.id)
-        )
-        wait_msg = await wait_msg_task
-        try:
-            humanized_text = await humanize_task
-            update_record_field(record_id, "humanized_text", humanized_text)
-            await safe_edit_or_send_long_text(
-                status_msg=wait_msg,
-                origin_msg=query.message,
-                full_text=humanized_text,
-                reply_markup=build_humanized_keyboard(record_id),
-            )
-        except Exception as e:
-            await wait_msg.edit_text(f"❌ خطا در انسانی‌سازی مجدد متن اصلی: {sanitize_error_message(e)}")
-
-    elif action == "trans_hum":
-        base_for_trans = record.get("humanized_text") or _get_raw_input_text(record)
-        await query.answer("🌐 در حال ترجمه هوشمند...")
-        wait_msg_task = asyncio.create_task(
-            query.message.reply_text(
-                "🌐 در حال ترجمه هوشمند با Gemini...",
-                reply_to_message_id=voice_msg_id,
-            )
-        )
-        trans_task = asyncio.create_task(translate_text_content(base_for_trans, user_id=user.id))
-        wait_msg = await wait_msg_task
-        try:
-            translated = await trans_task
-            await safe_edit_or_send_long_text(
-                status_msg=wait_msg,
-                origin_msg=query.message,
-                full_text=translated,
-                header_prefix="🌐 ترجمه:\n\n",
-            )
-        except Exception as e:
-            await wait_msg.edit_text(f"❌ خطا در ترجمه: {sanitize_error_message(e)}")
-
-    elif action == "tts_hum":
-        text_to_speak = record.get("humanized_text") or _get_raw_input_text(record)
-        await query.answer("🔊 در حال تولید ویس صوتی با Gemini 3.8 Flash TTS...")
-        wait_msg_task = asyncio.create_task(
-            query.message.reply_text(
-                "🔊 در حال تولید فایل صوتی با مدل Gemini 3.8 Flash TTS...",
-                reply_to_message_id=voice_msg_id,
-            )
-        )
-        tts_task = asyncio.create_task(generate_speech_audio(text_to_speak))
-        wait_msg = await wait_msg_task
-        try:
-            ogg_bytes = await tts_task
-            await query.message.reply_voice(
-                voice=io.BytesIO(ogg_bytes),
-                reply_to_message_id=voice_msg_id,
-                caption="🔊 ویس تولیدشده با مدل پرچمدار Gemini 3.8 Flash TTS",
-            )
-            await wait_msg.delete()
-        except Exception as e:
-            logger.error(f"TTS error: {sanitize_error_message(e)}")
-            await wait_msg.edit_text(f"❌ خطا در تولید ویس صوتی: {sanitize_error_message(e)}")
-
 
 def main() -> None:
-    if not BOT_TOKEN or not GEMINI_API_KEY:
-        logger.error("❌ کلیدهای ارتباطی یافت نشدند.")
+    if not BOT_TOKEN or not any(API_KEYS):
+        logger.error("❌ کلیدهای ارتباطی (BOT_TOKEN / API_KEYS) یافت نشدند.")
         sys.exit(1)
 
     init_db()
-    # گرم کردن کلاینت هوش مصنوعی در بدو شروع تا اولین پیام هیچ تأخیر اولیه‌ای نداشته باشد
     try:
         get_genai_client()
     except Exception:
         pass
 
-    logger.info("Starting @voiceandpasokhbot (Gemini 3.x Power Edition)...")
+    logger.info(
+        "Starting @voiceandpasokhbot | Two-Stage Pipeline Active | "
+        f"Audio Priority={AUDIO_PIPELINE_MODELS} | Chat Priority={CHAT_PIPELINE_MODELS} | "
+        f"Keys Configured={len(API_KEYS)} [KEY_1, KEY_2, KEY_3]"
+    )
 
-    # تنظیم استخر کانکشن بزرگ و HTTP/2 برای حذف تأخیرهای شبکه در ارتباط با سرور تلگرام
     try:
         t_request = HTTPXRequest(
             connection_pool_size=64,

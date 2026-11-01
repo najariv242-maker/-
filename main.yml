@@ -7,14 +7,12 @@ on:
       - main
       - master
   schedule:
-    # پشتیبان زمان‌بندی، در حالی که استارت اصلی بدون وقفه توسط گام Self Re-Trigger انجام می‌شود
     - cron: "*/30 * * * *"
 
 permissions:
   contents: read
   actions: write
 
-# cancel-in-progress باید false باشد تا وقتی گام آخر سیکل بعدی را استارت می‌زند، سیکل فعلی وسط مراحل Post کنسل نشود
 concurrency:
   group: voiceandpasokhbot-live-runner
   cancel-in-progress: false
@@ -59,14 +57,19 @@ jobs:
             openssl enc -d -aes-256-cbc -pbkdf2 -in voice_bot.db.enc -out voice_bot.db -pass env:CACHE_KEY_SECRET || rm -f voice_bot.db
           fi
 
-      - name: 🔥 اجرای ۲۴/۷ با مکانیزم ترکیبی Hot-Reload و Watchdog (ضد کرش و بدون افشای توکن)
+      - name: 🔥 اجرای ۲۴/۷ با معماری Pipeline دو مرحله‌ای و چرخش ۳ کلید (429 Fallback)
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          KEY_1: ${{ secrets.KEY_1 }}
+          KEY_2: ${{ secrets.KEY_2 }}
+          KEY_3: ${{ secrets.KEY_3 }}
+          GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ALLOWED_USER_IDS: ${{ secrets.ALLOWED_USER_IDS }}
           PRIVATE_CHAT_ONLY: "true"
-          TRANSCRIBE_MODEL: "gemini-2.5-flash"
-          CHAT_MODEL: "gemini-2.5-flash"
           DB_PATH: "voice_bot.db"
         run: |
           chmod +x run_workflow.sh
