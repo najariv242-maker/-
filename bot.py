@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ربات تلگرام تبدیل فوق‌سریع ویس به متن + پاسخ‌گوی انسانی (@voiceandpasokhbot)
+ربات تلگرام تبدیل فوق‌سریع ویس به متن + پاسخ‌گوی انسانی + انسانی‌سازی مستقیم متن خام (@voiceandpasokhbot)
 نسخه مجهز به معماری پایپ‌لاین دو مرحله‌ای (Two-Stage Pipeline) و مدیریت هوشمند خطای 429 با ۳ کلید مجزا [KEY_1, KEY_2, KEY_3]:
 
 ۱. مرحله اول — تبدیل ویس به متن (Audio-to-Text Pipeline):
@@ -12,17 +12,17 @@
    - ارسال خودکار پرامپت اختصاصی برای مدل‌های سری Flash Lite:
      "متن این فایل صوتی را دقیق، کلمه به کلمه و بدون هیچ توضیح اضافه پیاده کن."
 
-۲. مرحله دوم — تولید پاسخ متنی چت (Chat Pipeline):
+۲. مرحله دوم — تولید پاسخ متنی چت و انسانی‌سازی متن خام (Chat Pipeline):
    - اولویت اول: "gemini-3.5-flash-lite" (پاسخ‌دهی آنی و کمترین تاخیر)
    - اولویت دوم: "gemini-3.1-flash-lite" (جایگزین سریع با سهمیه بالا)
    - اولویت سوم: "gemini-3.8-flash" (مدل هوشمندتر و قوی‌تر برای پاسخ‌های تحلیلی/طولانی)
    - چرخش آنی کلیدها در خطای 429: KEY_1 -> KEY_2 -> KEY_3 و ریست به KEY_1 در مدل بعدی
 
-۳. الزامات فنی رعایت‌شده:
-   - دو کلاس مستقل و ماژولار (AudioToTextPipeline و ChatPipeline) با مدیریت Try/Except اختصاصی برای 429
-   - عدم ورود خطاهای غیر 429 (شبکه، فرمت فایل، کلید نامعتبر و غیره) به چرخه تعویض کلید (لاگ و Raise فوری)
-   - ذخیره وضعیت آخرین کلید و مدل موفق در حافظه و دیتابیس SQLite + شروع هوشمند از اولویت اول
-   - لاگ شفاف و دقیق از وضعیت سوییچ بین کلیدها و مدل‌ها با مخفی‌سازی کامل مقادیر محرمانه کلیدها
+۳. قابلیت «✨ انسانی‌سازی متن اصلی (بدون پاسخ)»:
+   - بازنویسی مستقیم متن خام اولیه کاربر با پرامپت اختصاصی HUMANIZE_RAW_TEXT_SYSTEM_PROMPT
+   - جلوگیری ۱۰۰٪ از باگ انسانی‌سازی پاسخ ربات به جای متن خام از طریق تابع _get_raw_input_text (خواندن مستقیم از transcript)
+   - کیبورد اختصاصی build_humanized_keyboard زیر پیام‌های انسانی‌شده به همراه دکمه «🔄 مدل دیگر (انسانی‌سازی مجدد متن خام)»
+   - پیش‌تولید در پس‌زمینه (_precompute_humanize_for_record) برای تحویل آنی در کسری از ثانیه
 """
 
 from __future__ import annotations
@@ -67,6 +67,7 @@ from google.genai import types
 
 from humanizer_skill import (
     HUMAN_TELEGRAM_REPLY_SYSTEM_PROMPT,
+    HUMANIZE_RAW_TEXT_SYSTEM_PROMPT,
     SUMMARY_SYSTEM_PROMPT,
     TRANSCRIPTION_CLEANUP_PROMPT,
     TRANSLATION_SYSTEM_PROMPT,
@@ -298,8 +299,10 @@ MAX_RAM_CACHE_SIZE = 500
 _RAM_RECORDS_BY_ID: OrderedDict[int, dict] = OrderedDict()
 _RAM_MSG_TO_RECORD_ID: OrderedDict[tuple[int, int], int] = OrderedDict()
 _PERSISTENT_DB_CONN: Optional[sqlite3.Connection] = None
+# نگهداری تسک‌های پیش‌تولید در پس‌زمینه تا اگر کاربر زودتر کلیک کرد، به همان تسک در حال اجرا وصل شود
 _INFLIGHT_REPLY_TASKS: dict[int, asyncio.Task] = {}
 _INFLIGHT_SUMMARY_TASKS: dict[int, asyncio.Task] = {}
+_INFLIGHT_HUMANIZE_TASKS: dict[int, asyncio.Task] = {}
 
 
 def _get_db_connection() -> sqlite3.Connection:
@@ -344,6 +347,7 @@ def init_db() -> None:
             transcript TEXT NOT NULL,
             summary TEXT,
             human_reply TEXT,
+            humanized_text TEXT,
             translation TEXT,
             created_at REAL NOT NULL
         )
@@ -355,6 +359,8 @@ def init_db() -> None:
         cursor.execute("ALTER TABLE voice_records ADD COLUMN bot_msg_id INTEGER")
     if "translation" not in existing_cols:
         cursor.execute("ALTER TABLE voice_records ADD COLUMN translation TEXT")
+    if "humanized_text" not in existing_cols:
+        cursor.execute("ALTER TABLE voice_records ADD COLUMN humanized_text TEXT")
 
     cursor.execute(
         """
@@ -739,7 +745,7 @@ class AudioToTextPipeline(BaseKeyModelPipeline):
 
 class ChatPipeline(BaseKeyModelPipeline):
     """
-    ۲. مرحله تولید پاسخ متنی چت (Chat Pipeline):
+    ۲. مرحله تولید پاسخ متنی چت و بازنویسی انسانی (Chat Pipeline):
     ترتیب اولویت مدل‌ها:
     - اولویت اول: "gemini-3.5-flash-lite" (پاسخ‌دهی آنی و کمترین تاخیر)
     - اولویت دوم: "gemini-3.1-flash-lite" (جایگزین سریع با سهمیه بالا)
@@ -989,16 +995,17 @@ def save_record(
     bot_msg_id: Optional[int] = None,
     summary: Optional[str] = None,
     translation: Optional[str] = None,
+    humanized_text: Optional[str] = None,
 ) -> int:
     now = time.time()
     conn = _get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT INTO voice_records (chat_id, voice_msg_id, bot_msg_id, transcript, summary, human_reply, translation, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO voice_records (chat_id, voice_msg_id, bot_msg_id, transcript, summary, human_reply, humanized_text, translation, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (chat_id, msg_id, bot_msg_id, transcript, summary, human_reply, translation, now),
+        (chat_id, msg_id, bot_msg_id, transcript, summary, human_reply, humanized_text, translation, now),
     )
     record_id = int(cursor.lastrowid)
     conn.commit()
@@ -1011,11 +1018,23 @@ def save_record(
         "transcript": transcript,
         "summary": summary,
         "human_reply": human_reply,
+        "humanized_text": humanized_text,
         "translation": translation,
         "created_at": now,
     }
     _cache_put(record)
     return record_id
+
+
+def _get_raw_input_text(record: dict) -> str:
+    """
+    استخراج دقیق متن خام اولیه‌ای که کاربر فرستاده است (از فیلد transcript)،
+    تا هرگز به اشتباه پاسخ تولیدشده توسط ربات (human_reply) دوباره انسانی‌سازی نشود.
+    """
+    raw = (record.get("transcript") or "").strip()
+    if raw.startswith("پیام مخاطب:\n") and "\n\nنکات پاسخ:\n" in raw:
+        return raw.split("\n\nنکات پاسخ:\n", 1)[1].strip()
+    return raw
 
 
 def get_record(record_id: int) -> Optional[dict]:
@@ -1058,7 +1077,7 @@ def get_record_by_msg_id(chat_id: int, msg_id: int) -> Optional[dict]:
 
 
 def update_record_field(record_id: int, field: str, value: str | int) -> None:
-    if field not in ("summary", "human_reply", "transcript", "bot_msg_id", "translation"):
+    if field not in ("summary", "human_reply", "humanized_text", "transcript", "bot_msg_id", "translation"):
         return
     if record_id in _RAM_RECORDS_BY_ID:
         _RAM_RECORDS_BY_ID[record_id][field] = value
@@ -1083,6 +1102,9 @@ def build_voice_action_keyboard(record_id: int, has_reply: bool = False) -> Inli
             InlineKeyboardButton("📝 خلاصه", callback_data=f"sum:{record_id}"),
         ],
         [
+            InlineKeyboardButton("✨ انسانی‌سازی متن اصلی (بدون پاسخ)", callback_data=f"humanize:{record_id}"),
+        ],
+        [
             InlineKeyboardButton("🌐 ترجمه", callback_data=f"trans:{record_id}"),
             InlineKeyboardButton("🔊 ارسال ویس (TTS)", callback_data=f"tts:{record_id}"),
         ],
@@ -1099,12 +1121,36 @@ def build_reply_keyboard(record_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
+                InlineKeyboardButton("✨ انسانی‌سازی متن اصلی (بدون پاسخ)", callback_data=f"humanize:{record_id}"),
+            ],
+            [
                 InlineKeyboardButton("🔄 مدل دیگر", callback_data=f"regen:{record_id}"),
                 InlineKeyboardButton("📝 خلاصه پیام", callback_data=f"sum:{record_id}"),
             ],
             [
                 InlineKeyboardButton("🌐 ترجمه", callback_data=f"trans:{record_id}"),
                 InlineKeyboardButton("🔊 ارسال ویس (TTS)", callback_data=f"tts:{record_id}"),
+            ],
+            [
+                InlineKeyboardButton("⚙️ تنظیمات مدل", callback_data="open_settings"),
+            ],
+        ]
+    )
+
+
+def build_humanized_keyboard(record_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🔄 مدل دیگر (انسانی‌سازی مجدد متن خام)", callback_data=f"regen_humanize:{record_id}"),
+            ],
+            [
+                InlineKeyboardButton("💬 جواب دادن به متن اصلی", callback_data=f"reply:{record_id}"),
+                InlineKeyboardButton("📝 خلاصه متن اصلی", callback_data=f"sum:{record_id}"),
+            ],
+            [
+                InlineKeyboardButton("🌐 ترجمه", callback_data=f"trans_hum:{record_id}"),
+                InlineKeyboardButton("🔊 ارسال ویس (TTS)", callback_data=f"tts_hum:{record_id}"),
             ],
             [
                 InlineKeyboardButton("⚙️ تنظیمات مدل", callback_data="open_settings"),
@@ -1372,6 +1418,38 @@ async def generate_human_telegram_reply(
     return strip_ai_punctuation_and_artifacts(raw_reply)
 
 
+async def generate_humanized_raw_text(
+    raw_text: str,
+    variation_hint: str = "",
+    user_id: Optional[int] = None,
+) -> str:
+    """
+    انسانی‌سازی مستقیم خودِ متن خام ورودی (بدون پاسخ دادن به آن)
+    مناسب برای مواقعی که کاربر متنی از هوش مصنوعی گرفته و می‌خواهد خودِ همان متن را انسانیزه کند.
+    اجرا از طریق ChatPipeline با ساختار Fallback و مدیریت خطای 429.
+    """
+    settings = get_user_model_settings(user_id) if user_id else {}
+    pref_model = settings.get("chat_model")
+    if pref_model not in CHAT_PIPELINE_MODELS:
+        pref_model = None
+
+    user_content = (
+        "متن خام زیر را بدون اینکه به آن پاسخ بدهی، با حفظ کامل محتوا و نکاتش "
+        "به لحن طبیعی و انسانی تلگرامی (طبق قوانین سیستم) بازنویسی و انسانی‌سازی کن:\n\n"
+        f"{raw_text}"
+    )
+    if variation_hint:
+        user_content += f"\n\nدستورالعمل تکمیلی:\n{variation_hint}"
+
+    raw_humanized = await CHAT_PIPELINE.generate_response(
+        input_text=user_content,
+        system_instruction=HUMANIZE_RAW_TEXT_SYSTEM_PROMPT,
+        temperature=0.6,
+        preferred_first_model=pref_model,
+    )
+    return strip_ai_punctuation_and_artifacts(raw_humanized)
+
+
 async def generate_summary_text(transcript: str, user_id: Optional[int] = None) -> str:
     """تولید خلاصه پیام از طریق ChatPipeline با ساختار Fallback و مدیریت خطای 429"""
     settings = get_user_model_settings(user_id) if user_id else {}
@@ -1402,7 +1480,7 @@ async def translate_text_content(text: str, user_id: Optional[int] = None) -> st
     )
 
 
-# ==================== پیش‌تولید هوشمند مرحله دوم در پس‌زمینه ====================
+# ==================== پیش‌تولید هوشمند در پس‌زمینه (Speculative Background Pre-Generation) ====================
 async def _precompute_reply_for_record(record_id: int, transcript: str, user_id: Optional[int] = None) -> str:
     try:
         reply = await generate_human_telegram_reply(transcript, user_id=user_id)
@@ -1421,14 +1499,28 @@ async def _precompute_summary_for_record(record_id: int, transcript: str, user_i
         _INFLIGHT_SUMMARY_TASKS.pop(record_id, None)
 
 
+async def _precompute_humanize_for_record(record_id: int, raw_text: str, user_id: Optional[int] = None) -> str:
+    try:
+        humanized = await generate_humanized_raw_text(raw_text, user_id=user_id)
+        update_record_field(record_id, "humanized_text", humanized)
+        return humanized
+    finally:
+        _INFLIGHT_HUMANIZE_TASKS.pop(record_id, None)
+
+
 def trigger_background_precomputation(record_id: int, transcript: str, user_id: Optional[int] = None) -> None:
-    """
-    بلافاصله پس از اتمام مرحله اول (تبدیل ویس به متن)، متن استخراج‌شده به عنوان ورودی
-    به مرحله دوم (ChatPipeline) داده می‌شود تا پاسخ متنی چت آماده گردد.
-    """
+    """تولید خودکار جواب انسانی، خلاصه و نسخه انسانی‌شده متن خام در پس‌زمینه تا دکمه‌ها در کسری از ثانیه تحویل دهند"""
     if record_id not in _INFLIGHT_REPLY_TASKS:
         _INFLIGHT_REPLY_TASKS[record_id] = asyncio.create_task(
             _precompute_reply_for_record(record_id, transcript, user_id=user_id)
+        )
+    if record_id not in _INFLIGHT_SUMMARY_TASKS:
+        _INFLIGHT_SUMMARY_TASKS[record_id] = asyncio.create_task(
+            _precompute_summary_for_record(record_id, transcript, user_id=user_id)
+        )
+    if record_id not in _INFLIGHT_HUMANIZE_TASKS:
+        _INFLIGHT_HUMANIZE_TASKS[record_id] = asyncio.create_task(
+            _precompute_humanize_for_record(record_id, transcript, user_id=user_id)
         )
 
 
@@ -1439,17 +1531,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     welcome_text = (
         "سلام 👋 به ربات هوشمند با معماری **Pipeline دو مرحله‌ای** خوش آمدید!\n\n"
-        "🚀 **معماری Fallback هوشمند (۳ کلید مجزا + مدیریت خطای 429):**\n"
+        "🚀 **امکانات و معماری Fallback هوشمند (۳ کلید مجزا + مدیریت خطای 429):**\n"
         "۱. **🎙️ مرحله اول (تبدیل ویس به متن):**\n"
         "   • اولویت اول: `gemini-3.5-transcribe`\n"
         "   • اولویت دوم: `gemini-3.5-flash-lite`\n"
         "   • اولویت سوم: `gemini-3.1-flash-lite`\n"
-        "۲. **💬 مرحله دوم (تولید پاسخ چت):**\n"
+        "۲. **💬 مرحله دوم (تولید پاسخ چت و بازنویسی انسانی):**\n"
         "   • اولویت اول: `gemini-3.5-flash-lite`\n"
         "   • اولویت دوم: `gemini-3.1-flash-lite`\n"
         "   • اولویت سوم: `gemini-3.8-flash`\n"
-        "۳. **🌐 ترجمه و 🔊 تبدیل متن به ویس (TTS):** همراه با چرخش خودکار کلیدهای سه‌گانه.\n"
-        "۴. **⚙️ مشاهده وضعیت کلیدها و مدل‌ها:** با دستور `/settings` یا `/model`.\n\n"
+        "۳. **✨ انسانی‌سازی متن اصلی (بدون پاسخ):** بازنویسی مستقیم متن خام اولیه به لحن طبیعی تلگرامی بدون پاسخ دادن به آن.\n"
+        "۴. **🌐 ترجمه و 🔊 تبدیل متن به ویس (TTS):** همراه با چرخش خودکار کلیدهای سه‌گانه.\n"
+        "۵. **⚙️ مشاهده وضعیت کلیدها و مدل‌ها:** با دستور `/settings` یا `/model`.\n\n"
         "💡 **روش استفاده:** کافیست یک ویس، فایل صوتی یا پیام متنی بفرستید تا فوراً پردازش شود."
     )
     if update.message:
@@ -1532,7 +1625,7 @@ async def process_single_voice(update: Update, context: ContextTypes.DEFAULT_TYP
             transcript=transcript,
         )
 
-        # ارسال خروجی مرحله اول به مرحله دوم (Chat Pipeline) در پس‌زمینه
+        # پیش‌تولید جواب انسانی، خلاصه و نسخه انسانی‌شده متن خام در پس‌زمینه
         trigger_background_precomputation(record_id, transcript, user_id=user.id)
 
         await safe_edit_or_send_long_text(
@@ -1623,6 +1716,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     transcript=f"پیام مخاطب:\n{base_text}\n\nنکات پاسخ:\n{incoming_text}",
                     human_reply=human_reply,
                 )
+                if rec_id not in _INFLIGHT_HUMANIZE_TASKS:
+                    _INFLIGHT_HUMANIZE_TASKS[rec_id] = asyncio.create_task(
+                        _precompute_humanize_for_record(rec_id, incoming_text, user_id=user.id)
+                    )
                 await safe_edit_or_send_long_text(
                     status_msg=wait_msg,
                     origin_msg=message,
@@ -1653,6 +1750,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             transcript=incoming_text,
             human_reply=human_reply,
         )
+        # پیش‌تولید نسخه انسانی‌شده متن خام اولیه در پس‌زمینه
+        if record_id not in _INFLIGHT_HUMANIZE_TASKS:
+            _INFLIGHT_HUMANIZE_TASKS[record_id] = asyncio.create_task(
+                _precompute_humanize_for_record(record_id, incoming_text, user_id=user.id)
+            )
         await safe_edit_or_send_long_text(
             status_msg=wait_msg,
             origin_msg=message,
@@ -1677,7 +1779,7 @@ def _build_settings_status_text(user_id: int) -> str:
         f"   • اولویت مدل‌ها: `{' -> '.join(AUDIO_PIPELINE_MODELS)}`\n"
         f"   • مدل شروع فعلی: `{s.get('transcribe_model')}`\n"
         f"   • آخرین اجرای موفق: `{a_last}` (تغییر کلید 429: `{a_state.total_429_switches}`)\n\n"
-        f"💬 **مرحله ۲ (پاسخ چت):**\n"
+        f"💬 **مرحله ۲ (پاسخ چت و انسانی‌سازی):**\n"
         f"   • اولویت مدل‌ها: `{' -> '.join(CHAT_PIPELINE_MODELS)}`\n"
         f"   • مدل شروع فعلی: `{s.get('chat_model')}`\n"
         f"   • آخرین اجرای موفق: `{c_last}` (تغییر کلید 429: `{c_state.total_429_switches}`)\n\n"
@@ -1882,10 +1984,10 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 
     elif action == "tts":
         text_to_speak = record.get("human_reply") or transcript
-        await query.answer("🔊 در حال تولید ویس صوتی...")
+        await query.answer("🔊 در حال تولید ویس صوتی با Gemini 3.8 Flash TTS...")
         wait_msg_task = asyncio.create_task(
             query.message.reply_text(
-                "🔊 در حال تولید فایل صوتی با مدل Gemini TTS...",
+                "🔊 در حال تولید فایل صوتی با مدل Gemini 3.8 Flash TTS...",
                 reply_to_message_id=voice_msg_id,
             )
         )
@@ -1896,7 +1998,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             await query.message.reply_voice(
                 voice=io.BytesIO(ogg_bytes),
                 reply_to_message_id=voice_msg_id,
-                caption="🔊 ویس تولیدشده با Gemini TTS",
+                caption="🔊 ویس تولیدشده با مدل پرچمدار Gemini 3.8 Flash TTS",
             )
             await wait_msg.delete()
         except Exception as e:
@@ -1931,6 +2033,116 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             )
         except Exception as e:
             await wait_msg.edit_text(f"❌ خطا در تولید جواب انسانی: {sanitize_error_message(e)}")
+
+    elif action == "humanize":
+        # استخراج مستقیم متن خام اولیه از فیلد transcript تا هرگز پاسخ ربات (human_reply) انسانی‌سازی نشود
+        raw_source_text = _get_raw_input_text(record)
+        if record.get("humanized_text"):
+            await query.answer("⚡ متن انسانی‌شده آماده است!")
+            await query.message.reply_text(
+                record["humanized_text"][:3950],
+                reply_to_message_id=voice_msg_id,
+                reply_markup=build_humanized_keyboard(record_id),
+            )
+            return
+
+        await query.answer("⚡ در حال انسانی‌سازی متن اصلی...")
+        wait_msg_task = asyncio.create_task(
+            query.message.reply_text(
+                "⚡ در حال انسانی‌سازی متن اصلی (بدون پاسخ دادن)...",
+                reply_to_message_id=voice_msg_id,
+            )
+        )
+        inflight = _INFLIGHT_HUMANIZE_TASKS.get(record_id)
+        humanize_task = inflight if inflight else asyncio.create_task(
+            _precompute_humanize_for_record(record_id, raw_source_text, user_id=user.id)
+        )
+        wait_msg = await wait_msg_task
+        try:
+            humanized_text = await humanize_task
+            await safe_edit_or_send_long_text(
+                status_msg=wait_msg,
+                origin_msg=query.message,
+                full_text=humanized_text,
+                reply_markup=build_humanized_keyboard(record_id),
+            )
+        except Exception as e:
+            await wait_msg.edit_text(f"❌ خطا در انسانی‌سازی متن اصلی: {sanitize_error_message(e)}")
+
+    elif action == "regen_humanize":
+        raw_source_text = _get_raw_input_text(record)
+        await query.answer("🔄 در حال بازنویسی و انسانی‌سازی مجدد متن خام...")
+        hint = (
+            "یک مدل بازنویسی متفاوت‌تر، روان‌تر و طبیعی‌تر از همین متن خام ورودی ارائه بده "
+            "به طوری که به هیچ وجه به متن جواب ندی بلکه خودِ همین متن خام رو با لحن خونسرد تلگرامی، "
+            "بدون هیچ علامت نگارشی، بدون نیم‌فاصله کتابی و بدون تعارف انسانی‌سازی کنی."
+        )
+        wait_msg_task = asyncio.create_task(
+            query.message.reply_text(
+                "⚡ در حال انسانی‌سازی مجدد متن اصلی با مدل جدید...",
+                reply_to_message_id=voice_msg_id,
+            )
+        )
+        humanize_task = asyncio.create_task(
+            generate_humanized_raw_text(raw_source_text, variation_hint=hint, user_id=user.id)
+        )
+        wait_msg = await wait_msg_task
+        try:
+            humanized_text = await humanize_task
+            update_record_field(record_id, "humanized_text", humanized_text)
+            await safe_edit_or_send_long_text(
+                status_msg=wait_msg,
+                origin_msg=query.message,
+                full_text=humanized_text,
+                reply_markup=build_humanized_keyboard(record_id),
+            )
+        except Exception as e:
+            await wait_msg.edit_text(f"❌ خطا در انسانی‌سازی مجدد متن اصلی: {sanitize_error_message(e)}")
+
+    elif action == "trans_hum":
+        base_for_trans = record.get("humanized_text") or _get_raw_input_text(record)
+        await query.answer("🌐 در حال ترجمه هوشمند...")
+        wait_msg_task = asyncio.create_task(
+            query.message.reply_text(
+                "🌐 در حال ترجمه هوشمند با Gemini...",
+                reply_to_message_id=voice_msg_id,
+            )
+        )
+        trans_task = asyncio.create_task(translate_text_content(base_for_trans, user_id=user.id))
+        wait_msg = await wait_msg_task
+        try:
+            translated = await trans_task
+            await safe_edit_or_send_long_text(
+                status_msg=wait_msg,
+                origin_msg=query.message,
+                full_text=translated,
+                header_prefix="🌐 ترجمه:\n\n",
+            )
+        except Exception as e:
+            await wait_msg.edit_text(f"❌ خطا در ترجمه: {sanitize_error_message(e)}")
+
+    elif action == "tts_hum":
+        text_to_speak = record.get("humanized_text") or _get_raw_input_text(record)
+        await query.answer("🔊 در حال تولید ویس صوتی با Gemini 3.8 Flash TTS...")
+        wait_msg_task = asyncio.create_task(
+            query.message.reply_text(
+                "🔊 در حال تولید فایل صوتی با مدل Gemini 3.8 Flash TTS...",
+                reply_to_message_id=voice_msg_id,
+            )
+        )
+        tts_task = asyncio.create_task(generate_speech_audio(text_to_speak))
+        wait_msg = await wait_msg_task
+        try:
+            ogg_bytes = await tts_task
+            await query.message.reply_voice(
+                voice=io.BytesIO(ogg_bytes),
+                reply_to_message_id=voice_msg_id,
+                caption="🔊 ویس تولیدشده با مدل پرچمدار Gemini 3.8 Flash TTS",
+            )
+            await wait_msg.delete()
+        except Exception as e:
+            logger.error(f"TTS error: {sanitize_error_message(e)}")
+            await wait_msg.edit_text(f"❌ خطا در تولید ویس صوتی: {sanitize_error_message(e)}")
 
 
 def main() -> None:
